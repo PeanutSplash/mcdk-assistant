@@ -16,8 +16,31 @@ jobs:
   build:
     name: Ubuntu GCC
     runs-on: ubuntu-latest
+    # 在 20.04 容器内构建，把二进制的 glibc 依赖压到 2.31，
+    # 以便在仍使用 glibc 2.31 的部署机上直接运行。
+    container:
+      image: ubuntu:20.04
 
     steps:
+      # 容器里以 root 运行，没有 sudo；checkout 之前必须先装好 git。
+      - name: Install Linux build tools
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            ca-certificates \
+            binutils \
+            cmake \
+            curl \
+            g++-10 \
+            gcc-10 \
+            git \
+            make \
+            ninja-build \
+            python3
+          update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-10 100
+          update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-10 100
+          git config --global --add safe.directory '*'
+
       - name: Checkout
         uses: actions/checkout@v7
         with:
@@ -31,11 +54,6 @@ jobs:
         shell: bash
         run: |
           git submodule update --init --recursive solutions || true
-
-      - name: Install Linux build tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ninja-build
 
       - name: Configure
         run: >
@@ -68,6 +86,28 @@ jobs:
           else
             test ! -f package/mcdk_solutions_cache.bin
           fi
+
+      - name: Verify glibc compatibility
+        shell: bash
+        run: |
+          set -euo pipefail
+          max_allowed=2.31
+          status=0
+          for bin in mcdk-assistant mcdk-asst-lite mcdk-asst-server; do
+            required=$(objdump -T "package/$bin" \
+              | grep -oE 'GLIBC_[0-9]+\.[0-9]+' \
+              | sed 's/^GLIBC_//' \
+              | sort -uV \
+              | tail -1)
+            highest=$(printf '%s\n%s\n' "$max_allowed" "$required" | sort -V | tail -1)
+            if [ "$highest" != "$max_allowed" ]; then
+              echo "::error::$bin requires glibc $required, exceeds the $max_allowed baseline"
+              status=1
+            else
+              echo "$bin requires glibc $required (<= $max_allowed)"
+            fi
+          done
+          exit $status
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
