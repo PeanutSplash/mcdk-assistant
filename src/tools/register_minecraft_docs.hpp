@@ -21,9 +21,12 @@
 #include <climits>
 #include <filesystem>
 #include <memory>
+#include <optional>
+#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 namespace mcdk {
 namespace minecraft_docs_detail {
@@ -56,6 +59,102 @@ inline std::string canonical_scope(std::string scope) {
 
 inline std::string lower_ascii(std::string value) {
     return command_parser_detail::to_lower_ascii(std::move(value));
+}
+
+inline std::string trim_ascii(std::string value) {
+    const auto begin = value.find_first_not_of(" \t\r\n");
+    if (begin == std::string::npos) return {};
+    const auto end = value.find_last_not_of(" \t\r\n");
+    return value.substr(begin, end - begin + 1);
+}
+
+inline bool is_identifier_query(const std::string& text) {
+    if (text.empty()) return false;
+    for (const unsigned char ch : text) {
+        if (!std::isalnum(ch) && ch != '_' && ch != ':' && ch != '.') return false;
+    }
+    return true;
+}
+
+inline std::string markdown_heading(const std::string& content) {
+    std::istringstream lines(content);
+    std::string line;
+    while (std::getline(lines, line)) {
+        line = trim_ascii(line);
+        if (line.rfind("## ", 0) == 0) return trim_ascii(line.substr(3));
+    }
+    return {};
+}
+
+inline std::optional<SearchResult> find_exact_heading(const std::vector<SearchResult>& results,
+                                                       const std::string& keyword) {
+    const std::string wanted = lower_ascii(trim_ascii(keyword));
+    for (const auto& result : results) {
+        if (!result.fragment) continue;
+        if (lower_ascii(markdown_heading(result.fragment->content)) == wanted)
+            return result;
+    }
+    return std::nullopt;
+}
+
+inline std::string markdown_h2_section(std::string text) {
+    std::istringstream lines(text);
+    std::string line;
+    std::string section;
+    bool saw_first_heading = false;
+    while (std::getline(lines, line)) {
+        if (line.rfind("## ", 0) == 0) {
+            if (saw_first_heading) break;
+            saw_first_heading = true;
+        }
+        section += line;
+        section += '\n';
+    }
+    return section;
+}
+
+inline mcp::json read_heading_section(const std::filesystem::path& knowledge_root,
+                                      SearchService& svc,
+                                      const SearchResult& result) {
+    const int start = result.fragment->line_start;
+    mcp::json params = {
+        {"path", result.fragment->file},
+        {"line_start", start},
+        {"line_end", start + 239},
+    };
+    auto response = handle_read_knowledge(knowledge_root, svc, params);
+    if (!response.contains("content") || !response["content"].is_array() || response["content"].empty())
+        return response;
+    auto& item = response["content"][0];
+    if (item.is_object() && item.value("type", "") == "text") {
+        item["text"] = markdown_h2_section(item.value("text", ""));
+        item["section"] = true;
+    }
+    return response;
+}
+
+inline mcp::json compact_search_result(const std::vector<SearchResult>& results) {
+    mcp::json content = mcp::json::array();
+    for (const auto& result : results) {
+        if (!result.fragment) continue;
+        std::istringstream lines(result.fragment->content);
+        std::string preview;
+        std::string line;
+        int line_count = 0;
+        while (line_count < 8 && std::getline(lines, line)) {
+            preview += line;
+            preview += '\n';
+            ++line_count;
+        }
+        content.push_back({
+            {"type", "text"}, {"text", preview},
+            {"file", result.fragment->file},
+            {"line_start", result.fragment->line_start},
+            {"line_end", result.fragment->line_end},
+            {"score", result.score}, {"compact", true},
+        });
+    }
+    return {{"content", content}};
 }
 
 inline mcp::json text_result(const std::string& text) {
@@ -244,6 +343,8 @@ inline std::string minecraft_docs_help_text(bool with_solutions = false) {
                                      如确实想搜含 diff/jsonui 的文档，加其他词，如 netease 差异 兼容。
   assets <关键词...> [--top <n>] [--assets <0|1|2>] [--bp|--rp]
                                      原版游戏资产（文件名+内容模糊匹配）；0=全部，1/--bp=行为包，2/--rp=资源包
+  api/event/enum <精确接口名>        单个标识符查询会自动返回完整 Markdown 条目（参数、返回值、示例），而非孤立标题。
+                                     `--exact` 强制启用该行为；`--compact` 仅返回每条命中的前 8 行，适合快速挑选资料。
   示例:
     wiki minecraft:food --top 8
     api ListenForEvent
@@ -296,7 +397,10 @@ inline mcp::json help_result(bool with_solutions = false) {
 }
 
 inline mcp::json error_with_help(const std::string& message, bool with_solutions = false) {
-    return text_result(message + "\n\n" + minecraft_docs_help_text(with_solutions));
+    (void)with_solutions;
+    return {{"isError", true}, {"content", mcp::json::array({{{"type", "text"},
+        {"text", message + " Example: minecraft_docs(command=\"help\")"}}})},
+        {"structuredContent", {{"status", "invalid_request"}, {"message", message}}}};
 }
 
 inline bool is_assets_scope(const std::string& scope) {
@@ -311,6 +415,21 @@ constexpr int kMaxTopK = 50;
 
 inline int clamped_top(const ParsedCommand& pc, int def = 6) {
     return std::clamp(flag_int(pc, "top", def), kMinTopK, kMaxTopK);
+}
+
+inline bool is_strict_integer(const std::string& value) {
+    if (value.empty()) return false;
+    size_t i = value[0] == '-' ? 1 : 0;
+    if (i == value.size()) return false;
+    for (; i < value.size(); ++i) if (!std::isdigit(static_cast<unsigned char>(value[i]))) return false;
+    return true;
+}
+
+inline std::string invalid_docs_number_flag(const ParsedCommand& pc) {
+    for (const char* key : {"top", "assets", "start", "end"}) {
+        if (has_flag(pc, key) && !is_strict_integer(flag_str(pc, key))) return std::string("invalid integer for --") + key;
+    }
+    return {};
 }
 
 inline int asset_scope_from_flags(const ParsedCommand& pc, int def = 0) {
@@ -335,7 +454,8 @@ inline mcp::json dispatch_assets_search(SearchService& svc, const ParsedCommand&
     return handle_search_game_assets(svc, params);
 }
 
-inline mcp::json dispatch_scoped_search(SearchService& svc,
+inline mcp::json dispatch_scoped_search(const std::filesystem::path& knowledge_root,
+                                        SearchService& svc,
                                         const ParsedCommand& pc,
                                         const std::string& requested_scope,
                                         const std::string& raw_command
@@ -372,11 +492,27 @@ inline mcp::json dispatch_scoped_search(SearchService& svc,
     if (!fn)
         return error_with_help("未知搜索分区: '" + requested_scope + "'。");
 
-    mcp::json params = {
-        {"keyword", keyword},
-        {"top_k",   top_k},
-    };
-    auto result = handle_search(svc, fn, params);
+    const bool exact_section = !has_flag(pc, "compact") && (has_flag(pc, "exact") ||
+        ((scope == "api" || scope == "event" || scope == "enum") && is_identifier_query(keyword)));
+    mcp::json result;
+    if (exact_section) {
+        const int exact_top = std::max(top_k, 20);
+        auto exact_match = find_exact_heading((svc.*fn)(keyword, exact_top), keyword);
+        if (exact_match) result = read_heading_section(knowledge_root, svc, *exact_match);
+    }
+
+    if (result.is_null()) {
+        mcp::json params = {
+            {"keyword", keyword},
+            {"top_k",   top_k},
+        };
+        result = handle_search(svc, fn, params);
+
+        if (has_flag(pc, "compact")) {
+            const int compact_top = std::min(top_k, 3);
+            result = compact_search_result((svc.*fn)(keyword, compact_top));
+        }
+    }
 
 #ifdef MCDK_WITH_PLUGINS
     if (plugins) {
@@ -445,7 +581,15 @@ inline mcp::json dispatch_minecraft_docs(const std::filesystem::path& knowledge_
                                          , const mcdk::solutions::SolutionIndex* solutions
 #endif
                                          ) {
-    ParsedCommand pc = parse_command(command);
+    static const CommandFlagSchema kDocsFlagSchema{
+        {"compact", "exact", "no-solution", "nosolution", "no-sol", "nosol", "nosolutions",
+         "bp", "rp", "behavior", "behavior_pack", "behavior-pack", "resource", "resource_pack", "resource-pack"},
+        {"top", "assets", "start", "end"}
+    };
+    ParsedCommand pc = parse_command(command, kDocsFlagSchema);
+    if (!pc.error.empty()) return error_with_help(pc.error, false);
+    if (const auto invalid_number = invalid_docs_number_flag(pc); !invalid_number.empty())
+        return error_with_help(invalid_number, false);
     std::string sub = canonical_scope(pc.sub);
 
 #ifdef MCDK_WITH_SOLUTIONS
@@ -473,8 +617,8 @@ inline mcp::json dispatch_minecraft_docs(const std::filesystem::path& knowledge_
     if (sub == "list")    return dispatch_list(knowledge_root, svc, pc);
     if (sub == "modsdk-help" || sub == "mod-sdk-help" || sub == "vanilla-modsdk-help" || sub == "original-modsdk-help")
         return text_result(modsdk_arch_text());
-    if (sub == "diff")    return text_result(netease_diff_text());
-    if (sub == "jsonui" || sub == "json-ui") return text_result(netease_jsonui_text());
+    if (sub == "diff" || sub == "jsonui" || sub == "json-ui")
+        return error_with_help("Use minecraft_docs_guide with topic netease-diff or netease-jsonui.", with_solutions);
 
 #ifdef MCDK_WITH_SOLUTIONS
     if (with_solutions && (sub == "solution" || sub == "sol")) {
@@ -488,10 +632,7 @@ inline mcp::json dispatch_minecraft_docs(const std::filesystem::path& knowledge_
         return dispatch_assets_search(svc, pc);
 
     if (sub == "netease") {
-        std::string topic = lower_ascii(pc.positional);
-        if (topic.empty() || topic == "diff" || topic == "jsonui" || has_flag(pc, "type"))
-            return dispatch_netease(pc);
-        return maybe_append_solutions(dispatch_scoped_search(svc, pc, sub, command
+        return maybe_append_solutions(dispatch_scoped_search(knowledge_root, svc, pc, sub, command
 #ifdef MCDK_WITH_PLUGINS
             , plugins
 #endif
@@ -499,13 +640,84 @@ inline mcp::json dispatch_minecraft_docs(const std::filesystem::path& knowledge_
     }
 
     if (search_fn_for_scope(sub))
-        return maybe_append_solutions(dispatch_scoped_search(svc, pc, sub, command
+        return maybe_append_solutions(dispatch_scoped_search(knowledge_root, svc, pc, sub, command
 #ifdef MCDK_WITH_PLUGINS
             , plugins
 #endif
         ), canonical_scope(sub));
 
     return error_with_help("未知子命令: '" + pc.sub + "'。", with_solutions);
+}
+
+inline mcp::json typed_search(SearchService& svc, const mcp::json& params) {
+    const std::string query = trim_ascii(params.value("query", ""));
+    if (query.empty() || query.size() > 512) return docs_error("query must contain 1-512 characters");
+    std::string corpus = canonical_scope(params.value("corpus", "all"));
+    if (corpus == "auto") corpus = "all";
+    const int limit = params.value("limit", 5);
+    const int max_chars = params.value("max_chars", 6000);
+    if (limit < 1 || limit > 20) return docs_error("limit must be between 1 and 20");
+    if (max_chars < 512 || max_chars > 20000) return docs_error("max_chars must be between 512 and 20000");
+    if (is_assets_scope(corpus)) {
+        const std::string asset_scope = params.value("asset_scope", "all");
+        const int scope = asset_scope == "bp" ? 1 : asset_scope == "rp" ? 2 : asset_scope == "all" ? 0 : -1;
+        if (scope < 0) return docs_error("asset_scope must be all, bp, or rp");
+        return handle_search_game_assets(svc, {{"keyword", query}, {"scope", scope}, {"top_k", limit}, {"max_chars", max_chars}});
+    }
+    const auto fn = search_fn_for_scope(corpus);
+    if (!fn) return docs_error("corpus must be auto, api, event, enum, wiki, dev, qumod, netease, or assets");
+    return handle_search(svc, fn, {{"keyword", query}, {"top_k", limit}, {"max_chars", max_chars}, {"corpus", corpus}});
+}
+
+inline bool parse_docs_ref(const std::string& ref, std::string& path, int& start, int& end) {
+    constexpr const char* prefix = "mcdk://knowledge/";
+    if (ref.rfind(prefix, 0) != 0) return false;
+    const auto marker = ref.rfind("#L");
+    if (marker == std::string::npos) return false;
+    const auto dash = ref.find("-L", marker + 2);
+    if (dash == std::string::npos) return false;
+    path = ref.substr(std::char_traits<char>::length(prefix), marker - std::char_traits<char>::length(prefix));
+    try {
+        size_t used_start = 0, used_end = 0;
+        start = std::stoi(ref.substr(marker + 2, dash - marker - 2), &used_start);
+        end = std::stoi(ref.substr(dash + 2), &used_end);
+        return used_start == dash - marker - 2 && used_end == ref.size() - dash - 2 && start > 0 && end >= start && is_safe_relative_docs_path(path);
+    } catch (...) { return false; }
+}
+
+inline mcp::json typed_read(const std::filesystem::path& knowledge_root, SearchService& svc, const mcp::json& params) {
+    std::string path;
+    int ref_start = 1, ref_end = INT_MAX;
+    if (params.contains("ref") && !params["ref"].is_null()) {
+        if (!parse_docs_ref(params.value("ref", ""), path, ref_start, ref_end)) return docs_error("invalid mcdk documentation ref");
+    } else {
+        path = params.value("path", "");
+    }
+    if (path.empty() || !is_safe_relative_docs_path(path)) return docs_error("a safe relative path or ref is required");
+    const int start = params.value("start_line", ref_start);
+    const int end = params.value("end_line", ref_end);
+    const int max_chars = params.value("max_chars", 8000);
+    if (start < 1 || end < start || max_chars < 512 || max_chars > 20000) return docs_error("invalid line range or max_chars");
+    return handle_read_knowledge(knowledge_root, svc, {{"path", path}, {"line_start", start}, {"line_end", end}, {"max_chars", max_chars}});
+}
+
+inline mcp::json typed_guide(const mcp::json& params) {
+    const std::string topic = lower_ascii(params.value("topic", ""));
+    std::string text;
+    if (topic == "modsdk") text = modsdk_arch_text();
+    else if (topic == "netease-diff") text = netease_diff_text();
+    else if (topic == "netease-jsonui") text = netease_jsonui_text();
+    else if (topic == "python-runtime") text = "Minecraft ModSDK uses Python 2.7.18. Keep source UTF-8 and follow the project runtime conventions.";
+    else if (topic == "coding-rules") text = "Use stable namespaced identifiers, keep client/server responsibilities separate, and validate client input on the server.";
+    else return docs_error("topic must be modsdk, netease-diff, netease-jsonui, python-runtime, or coding-rules");
+    return {{"content", mcp::json::array({{{"type", "text"}, {"text", text}}})},
+            {"structuredContent", {{"status", "ok"}, {"topic", topic}, {"content", text}}}};
+}
+
+inline mcp::json search_output_schema() {
+    return {{"type", "object"}, {"required", mcp::json::array({"query", "status", "hits"})},
+            {"properties", {{"query", {{"type", "string"}}}, {"status", {{"enum", mcp::json::array({"ok", "not_found", "ambiguous"})}}},
+                {"truncated", {{"type", "boolean"}}}, {"hits", {{"type", "array"}}}}}};
 }
 
 } // namespace minecraft_docs_detail
@@ -537,7 +749,7 @@ inline void register_minecraft_docs_tools(mcp::server& srv, SearchService& searc
         .with_string_param("command",
             "命令语句，如 'wiki minecraft:food'、'assets stair --rp'、'modsdk-help' 或 'read <path>'；"
             "初次接触网易 ModSDK 项目时建议先传 'help' 了解开发规范与全部命令；确认使用原版加载器后可继续阅读 'modsdk-help'。", true)
-        .with_read_only_hint(true).with_idempotent_hint(true).build();
+        .with_read_only_hint(true).with_open_world_hint(false).build();
 
     srv.register_tool(tool,
         [knowledge_root, &search_svc
@@ -558,6 +770,40 @@ inline void register_minecraft_docs_tools(mcp::server& srv, SearchService& searc
 #endif
             );
         });
+
+    auto search_tool = mcp::tool_builder("minecraft_docs_search")
+        .with_description("Search Minecraft documentation with bounded previews. Every hit includes a stable ref for minecraft_docs_read.")
+        .with_string_param("query", "Required search query.", true)
+        .with_string_param("corpus", "auto, api, event, enum, wiki, dev, qumod, netease, or assets.", false)
+        .with_number_param("limit", "Results, 1-20; default 5.", false)
+        .with_number_param("max_chars", "Whole response character budget, 512-20000; default 6000.", false)
+        .with_string_param("detail", "preview (default) or section.", false)
+        .with_string_param("asset_scope", "For assets: all, bp, or rp.", false)
+        .with_read_only_hint(true).with_open_world_hint(false)
+        .with_output_schema(minecraft_docs_detail::search_output_schema()).build();
+    search_tool.parameters_schema["properties"]["corpus"]["enum"] = {"auto", "api", "event", "enum", "wiki", "dev", "qumod", "netease", "assets"};
+    search_tool.parameters_schema["properties"]["detail"]["enum"] = {"preview", "section"};
+    search_tool.parameters_schema["properties"]["asset_scope"]["enum"] = {"all", "bp", "rp"};
+    srv.register_tool(search_tool, [&search_svc](const mcp::json& params, const std::string&) { return minecraft_docs_detail::typed_search(search_svc, params); });
+
+    auto read_tool = mcp::tool_builder("minecraft_docs_read")
+        .with_description("Read a documentation file or the stable ref returned by minecraft_docs_search.")
+        .with_string_param("ref", "Stable mcdk://knowledge/... reference from search.", false)
+        .with_string_param("path", "Safe knowledge-relative file path when no ref is available.", false)
+        .with_number_param("start_line", "1-based start line.", false)
+        .with_number_param("end_line", "Inclusive end line.", false)
+        .with_number_param("max_chars", "Character budget, 512-20000; default 8000.", false)
+        .with_read_only_hint(true).with_open_world_hint(false)
+        .with_output_schema({{"type", "object"}, {"required", mcp::json::array({"status", "ref", "content"})}}).build();
+    srv.register_tool(read_tool, [knowledge_root, &search_svc](const mcp::json& params, const std::string&) { return minecraft_docs_detail::typed_read(knowledge_root, search_svc, params); });
+
+    auto guide_tool = mcp::tool_builder("minecraft_docs_guide")
+        .with_description("Read concise Minecraft development guidance by topic.")
+        .with_string_param("topic", "modsdk, netease-diff, netease-jsonui, python-runtime, or coding-rules.", true)
+        .with_read_only_hint(true).with_open_world_hint(false)
+        .with_output_schema({{"type", "object"}, {"required", mcp::json::array({"status", "topic", "content"})}}).build();
+    guide_tool.parameters_schema["properties"]["topic"]["enum"] = {"modsdk", "netease-diff", "netease-jsonui", "python-runtime", "coding-rules"};
+    srv.register_tool(guide_tool, [](const mcp::json& params, const std::string&) { return minecraft_docs_detail::typed_guide(params); });
 }
 
 } // namespace mcdk

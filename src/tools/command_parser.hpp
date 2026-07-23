@@ -7,6 +7,7 @@
 //   flag_str / flag_int / has_flag
 #include <cctype>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -105,7 +106,25 @@ struct ParsedCommand {
     std::string                        sub;        // command, lowercased and without leading '/'
     std::string                        positional; // positional args joined with a single space
     std::map<std::string, std::string> flags;      // normalized long key -> value
+    std::string                        error;      // set only by schema-aware parsing
 };
+
+struct CommandFlagSchema {
+    std::set<std::string> boolean_flags;
+    std::set<std::string> value_flags;
+};
+
+inline bool command_has_unclosed_quote(const std::string& line) {
+    char quote = 0;
+    for (size_t i = 0; i < line.size(); ++i) {
+        if (quote && line[i] == '\\' && i + 1 < line.size()) { ++i; continue; }
+        if (line[i] == '"' || line[i] == '\'') {
+            if (!quote) quote = line[i];
+            else if (quote == line[i]) quote = 0;
+        }
+    }
+    return quote != 0;
+}
 
 inline ParsedCommand parse_command(const std::string& line) {
     using namespace command_parser_detail;
@@ -145,6 +164,46 @@ inline ParsedCommand parse_command(const std::string& line) {
         }
     }
     pc.positional = positional;
+    return pc;
+}
+
+// Opt-in strict parser for command tools that have a stable flag contract.
+// Existing command tools keep the legacy permissive parser until migrated.
+inline ParsedCommand parse_command(const std::string& line, const CommandFlagSchema& schema) {
+    using namespace command_parser_detail;
+    ParsedCommand pc;
+    if (command_has_unclosed_quote(line)) { pc.error = "unterminated quoted argument"; return pc; }
+    auto tokens = tokenize_command_line(line);
+    if (tokens.empty()) return pc;
+    pc.sub = tokens[0];
+    if (!pc.sub.empty() && pc.sub.front() == '/') pc.sub.erase(pc.sub.begin());
+    pc.sub = to_lower_ascii(pc.sub);
+    bool flags_enabled = true;
+    for (size_t i = 1; i < tokens.size(); ++i) {
+        const auto& tok = tokens[i];
+        if (flags_enabled && tok == "--") { flags_enabled = false; continue; }
+        if (!flags_enabled || !is_flag_token(tok)) { append_positional(pc.positional, tok); continue; }
+        const size_t start = (tok.size() >= 2 && tok[1] == '-') ? 2 : 1;
+        const std::string body = tok.substr(start);
+        const auto equal = body.find('=');
+        std::string key = normalize_flag_key(to_lower_ascii(body.substr(0, equal)));
+        if (key.empty()) { pc.error = "empty flag name"; return pc; }
+        const bool is_boolean = schema.boolean_flags.count(key) != 0;
+        const bool takes_value = schema.value_flags.count(key) != 0;
+        if (!is_boolean && !takes_value) { pc.error = "unknown flag: --" + key; return pc; }
+        if (pc.flags.count(key)) { pc.error = "duplicate flag: --" + key; return pc; }
+        if (is_boolean) {
+            if (equal != std::string::npos) { pc.error = "boolean flag does not take a value: --" + key; return pc; }
+            pc.flags[key] = "true";
+            continue;
+        }
+        std::string value;
+        if (equal != std::string::npos) value = body.substr(equal + 1);
+        else if (i + 1 < tokens.size() && !is_flag_token(tokens[i + 1])) value = tokens[++i];
+        else { pc.error = "missing value for --" + key; return pc; }
+        if (value.empty()) { pc.error = "missing value for --" + key; return pc; }
+        pc.flags[key] = std::move(value);
+    }
     return pc;
 }
 

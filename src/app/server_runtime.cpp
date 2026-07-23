@@ -56,7 +56,10 @@ mcp::server::configuration make_server_config() {
     mcp::server::configuration conf;
     conf.port = 18766;
 #ifdef MCDK_SERVER
-    conf.host = "0.0.0.0";
+    // The server has no built-in authentication layer.  Keep its default
+    // deployment boundary local; public exposure must be provided by an
+    // authenticated reverse proxy or an explicit future auth configuration.
+    conf.host = "127.0.0.1";
     conf.name = "mcdk-assistant-server";
     conf.version = "0.5.0-server";
 #elif defined(MCDK_LITE)

@@ -103,10 +103,6 @@ public:
         std::unordered_map<size_t, double> score_map;
         score_map.reserve(std::min(num_docs_, size_t(4096)));
 
-        const bool has_top_k = top_k > 0;
-        const size_t desired_results = has_top_k ? static_cast<size_t>(top_k) : size_t(64);
-        const size_t max_accumulate_docs = std::max<size_t>(desired_results * 48, 2048);
-
         for (const auto& qt : unique_tokens) {
             auto idf_it = idf_.find(qt);
             if (idf_it == idf_.end()) continue;
@@ -115,30 +111,17 @@ public:
             auto idx_it = inverted_index_.find(qt);
             if (idx_it == inverted_index_.end()) continue;
 
-            // 对超长 posting list 限制处理量（高频词 IDF 已经很低，继续扫描收益极小）
+            // Never truncate the head of a posting list: its order is document
+            // order, not relevance order.  Truncating it made later documents
+            // impossible to retrieve for common terms.
             const auto& postings = idx_it->second;
-            const bool extremely_common = postings.size() > num_docs_ / 3;
-            const bool low_signal_term   = qt.size() <= 3 || idf_val < 0.12;
-            const size_t MAX_POSTING = extremely_common
-                ? (low_signal_term ? 256 : 1024)
-                : (low_signal_term ? 1024 : 4096);
-            size_t pcount = std::min(postings.size(), MAX_POSTING);
-
-            for (size_t pi = 0; pi < pcount; ++pi) {
-                const auto& posting = postings[pi];
+            for (const auto& posting : postings) {
                 double dl = static_cast<double>(doc_lengths_[posting.doc_id]);
                 double tf = static_cast<double>(posting.tf);
                 double tf_norm = (tf * (K1 + 1.0))
                     / (tf + K1 * (1.0 - B + B * dl / avg_dl_));
                 score_map[posting.doc_id] += idf_val * tf_norm;
 
-                if (score_map.size() >= max_accumulate_docs && low_signal_term) {
-                    break;
-                }
-            }
-
-            if (score_map.size() >= max_accumulate_docs && low_signal_term) {
-                continue;
             }
         }
 
@@ -154,13 +137,17 @@ public:
                               results.begin() + static_cast<ptrdiff_t>(top_k),
                               results.end(),
                               [](const SearchResult& a, const SearchResult& b) {
-                                  return a.score > b.score;
+                                  if (a.score != b.score) return a.score > b.score;
+                                  if (a.fragment->file != b.fragment->file) return a.fragment->file < b.fragment->file;
+                                  return a.fragment->line_start < b.fragment->line_start;
                               });
             results.resize(static_cast<size_t>(top_k));
         } else {
             std::sort(results.begin(), results.end(),
                 [](const SearchResult& a, const SearchResult& b) {
-                    return a.score > b.score;
+                    if (a.score != b.score) return a.score > b.score;
+                    if (a.fragment->file != b.fragment->file) return a.fragment->file < b.fragment->file;
+                    return a.fragment->line_start < b.fragment->line_start;
                 });
         }
 

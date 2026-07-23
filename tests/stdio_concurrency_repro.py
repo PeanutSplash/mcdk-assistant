@@ -113,8 +113,8 @@ def run_case(exe, keywords, top_k, timeout, startup_timeout, mode):
                     "id": 100 + offset,
                     "method": "tools/call",
                     "params": {
-                        "name": "search_game_assets",
-                        "arguments": {"keyword": keyword, "scope": 0, "top_k": top_k},
+                        "name": "minecraft_docs_search",
+                        "arguments": {"query": keyword, "corpus": "assets", "asset_scope": "all", "limit": top_k, "max_chars": 4000},
                     },
                 },
             )

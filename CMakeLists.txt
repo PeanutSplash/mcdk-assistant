@@ -279,5 +279,6 @@ endif()
 
 option(MCDK_BUILD_TESTS "Build test executables" OFF)
 if(MCDK_BUILD_TESTS)
+    enable_testing()
     add_subdirectory(tests)
 endif()

@@ -11,6 +11,7 @@
 #include <cstring>
 #include <cstdio>
 #include <unordered_map>
+#include <limits>
 
 namespace mcdk {
 
@@ -18,7 +19,7 @@ inline std::string fs_native_narrow(const std::filesystem::path& path) {
     return path.string();
 }
 
-// 索引缓存文件格式 (v5):
+// 索引缓存文件格式 (v6):
 // [magic: 8B] [version: 4B] [fingerprint] [data...]
 // v5: 倒排表存储 (doc_id, tf) 对而非仅 doc_id，搜索时 O(1) 取 TF
 // GameAssets: entries 只存 rel_path，content 直接从 fragments 引用
@@ -26,26 +27,43 @@ inline std::string fs_native_narrow(const std::filesystem::path& path) {
 class IndexCache {
 public:
     static constexpr char     MAGIC[8] = {'M','C','D','K','I','D','X','\0'};
-    static constexpr uint32_t VERSION  = 5;
+    static constexpr uint32_t VERSION  = 6;
+    static constexpr uint64_t MAX_CACHE_BYTES = 4ULL * 1024 * 1024 * 1024;
+    static constexpr uint32_t MAX_STRING_BYTES = 16U * 1024 * 1024;
+    static constexpr uint32_t MAX_FRAGMENTS = 500000;
+    static constexpr uint32_t MAX_TOKENS_PER_DOC = 200000;
+    static constexpr uint32_t MAX_INDEX_TERMS = 2000000;
+    static constexpr uint32_t MAX_POSTINGS_PER_TERM = 2000000;
 
-    // 指纹只看几个高价值目录的 mtime，避免每次启动全量扫描文件元数据。
-    static std::string compute_fingerprint(const std::filesystem::path& knowledge_dir) {
+    // Stable manifest fingerprint: changes to an existing file must invalidate
+    // the cache, not only changes to a top-level directory.
+    static std::string compute_fingerprint(const std::filesystem::path& knowledge_dir,
+                                           const std::filesystem::path& dicts_dir = {}) {
         namespace fs = std::filesystem;
-        static const char* WATCH[] = {
-            "ModAPI", "BedrockWiki", "BedrockDev", "NeteaseGuide", "QuModDocs",
-            "GameAssets/behavior_packs", "GameAssets/resource_packs"
-        };
         uint64_t hash = 14695981039346656037ULL;
-        for (const auto* sub : WATCH) {
-            fs::path p = knowledge_dir / sub;
-            std::string s = std::string(sub) + ":";
-            if (fs::exists(p)) {
-                const auto ticks = static_cast<int64_t>(fs::last_write_time(p).time_since_epoch().count());
-                s += std::to_string(ticks);
-            } else {
-                s += "0";
+        auto add = [&](const std::string& value) {
+            for (unsigned char c : value) { hash ^= c; hash *= 1099511628211ULL; }
+        };
+        add("index-format=6;chunker=2;tokenizer=2;");
+        std::vector<std::pair<fs::path, std::string>> files;
+        std::error_code ec;
+        if (fs::exists(knowledge_dir, ec)) {
+            for (fs::recursive_directory_iterator it(knowledge_dir, ec), end; !ec && it != end; it.increment(ec)) {
+                if (it->is_regular_file(ec)) files.push_back({it->path(), "knowledge/"});
             }
-            for (char c : s) { hash ^= static_cast<uint8_t>(c); hash *= 1099511628211ULL; }
+        }
+        if (!dicts_dir.empty() && fs::exists(dicts_dir, ec)) {
+            for (fs::recursive_directory_iterator it(dicts_dir, ec), end; !ec && it != end; it.increment(ec)) {
+                if (it->is_regular_file(ec)) files.push_back({it->path(), "dicts/"});
+            }
+        }
+        std::sort(files.begin(), files.end());
+        for (const auto& [file, prefix] : files) {
+            const auto& base = prefix == "dicts/" ? dicts_dir : knowledge_dir;
+            const auto rel = fs::relative(file, base, ec).generic_string();
+            const auto size = fs::file_size(file, ec);
+            const auto mtime = static_cast<int64_t>(fs::last_write_time(file, ec).time_since_epoch().count());
+            if (!ec) add(prefix + rel + ":" + std::to_string(size) + ":" + std::to_string(mtime) + ";");
         }
         char buf[17];
         snprintf(buf, sizeof(buf), "%016llx", static_cast<unsigned long long>(hash));
@@ -99,9 +117,10 @@ public:
     {
         // 这里仍用 C stdio，主要是为了保持序列化实现简单且可控。
         std::string cache_path_text = fs_native_narrow(cache_path);
-        FILE* fp = std::fopen(cache_path_text.c_str(), "wb");
+        const auto temp_path = cache_path.string() + ".tmp";
+        FILE* fp = std::fopen(temp_path.c_str(), "wb");
         if (!fp) {
-            std::cerr << "[MCDK] cache: cannot open for writing: " << cache_path_text << std::endl;
+            std::cerr << "[MCDK] cache: cannot open for writing: " << temp_path << std::endl;
             return false;
         }
         static constexpr size_t WRITE_BUF = 64 * 1024;
@@ -133,10 +152,18 @@ public:
         long written = std::ftell(fp);
         std::fclose(fp);
         if (ok && written > 0) {
+            std::error_code ec;
+            std::filesystem::rename(temp_path, cache_path, ec);
+            if (ec) {
+                std::filesystem::remove(temp_path, ec);
+                std::cerr << "[MCDK] cache: atomic rename failed: " << ec.message() << std::endl;
+                return false;
+            }
             std::cerr << "[MCDK] cache: saved " << (written / 1024 / 1024)
                       << " MB to " << cache_path_text << std::endl;
             return true;
         }
+        std::remove(temp_path.c_str());
         std::cerr << "[MCDK] cache: write error" << std::endl;
         return false;
     }
@@ -158,7 +185,7 @@ public:
         std::fseek(fp, 0, SEEK_END);
         long fsize = std::ftell(fp);
         std::fseek(fp, 0, SEEK_SET);
-        if (fsize < 16) { std::fclose(fp); return false; }
+        if (fsize < 16 || static_cast<uint64_t>(fsize) > MAX_CACHE_BYTES) { std::fclose(fp); return false; }
 
         char magic[8];
         if (std::fread(magic, 1, 8, fp) != 8 || std::memcmp(magic, MAGIC, 8) != 0) {
@@ -166,19 +193,20 @@ public:
             std::fclose(fp); return false;
         }
 
-        uint32_t ver = fread_u32(fp);
-        if (ver != VERSION) {
+        uint32_t ver = 0;
+        if (!fread_u32(fp, ver) || ver != VERSION) {
             std::cerr << "[MCDK] cache: version " << ver << " != " << VERSION << ", rebuilding" << std::endl;
             std::fclose(fp); return false;
         }
 
-        out.fingerprint = fread_string(fp);
+        if (!fread_string(fp, out.fingerprint)) { std::fclose(fp); return false; }
         if (!skip_fingerprint_check && out.fingerprint != expected_fp) {
             std::cerr << "[MCDK] cache: fingerprint mismatch, rebuilding" << std::endl;
             std::fclose(fp); return false;
         }
 
-        uint32_t cat_n = fread_u32(fp);
+        uint32_t cat_n = 0;
+        if (!fread_u32(fp, cat_n) || cat_n != 7) { std::fclose(fp); return false; }
         out.categories.resize(cat_n);
         for (uint32_t i = 0; i < cat_n; ++i) {
             if (!fread_fragments(fp, out.categories[i].fragments)) { std::fclose(fp); return false; }
@@ -186,13 +214,15 @@ public:
             if (!fread_bm25(fp, out.categories[i].bm25)) { std::fclose(fp); return false; }
         }
 
-        uint32_t ga_n = fread_u32(fp);
+        uint32_t ga_n = 0;
+        if (!fread_u32(fp, ga_n) || ga_n != 2) { std::fclose(fp); return false; }
         out.game_assets.resize(ga_n);
         for (uint32_t i = 0; i < ga_n; ++i) {
-            uint32_t rp_n = fread_u32(fp);
+            uint32_t rp_n = 0;
+            if (!fread_u32(fp, rp_n) || rp_n > MAX_FRAGMENTS) { std::fclose(fp); return false; }
             out.game_assets[i].rel_paths.resize(rp_n);
             for (uint32_t j = 0; j < rp_n; ++j)
-                out.game_assets[i].rel_paths[j] = fread_string(fp);
+                if (!fread_string(fp, out.game_assets[i].rel_paths[j])) { std::fclose(fp); return false; }
             if (!fread_fragments(fp, out.game_assets[i].fragments)) { std::fclose(fp); return false; }
             if (!fread_tokenized(fp, out.game_assets[i].tokenized_docs)) { std::fclose(fp); return false; }
             if (!fread_bm25(fp, out.game_assets[i].bm25)) { std::fclose(fp); return false; }
@@ -271,78 +301,86 @@ private:
     // ── 流式读取辅助（直接 fread，无整块 buffer）──
     // ══════════════════════════════════════════════════════════════════
 
-    static uint32_t fread_u32(FILE* fp) {
-        uint32_t v = 0;
-        std::fread(&v, 4, 1, fp);
-        return v;
+    static bool fread_u32(FILE* fp, uint32_t& v) {
+        return std::fread(&v, sizeof(v), 1, fp) == 1;
     }
-    static uint64_t fread_u64(FILE* fp) {
-        uint64_t v = 0;
-        std::fread(&v, 8, 1, fp);
-        return v;
+    static bool fread_u64(FILE* fp, uint64_t& v) {
+        return std::fread(&v, sizeof(v), 1, fp) == 1;
     }
-    static double fread_double(FILE* fp) {
-        double v = 0.0;
-        std::fread(&v, 8, 1, fp);
-        return v;
+    static bool fread_double(FILE* fp, double& v) {
+        return std::fread(&v, sizeof(v), 1, fp) == 1 && std::isfinite(v);
     }
-    static std::string fread_string(FILE* fp) {
-        uint32_t len = fread_u32(fp);
-        if (len == 0) return {};
-        std::string s(len, '\0');
-        if (std::fread(s.data(), 1, len, fp) != len) return {};
-        return s;
+    static bool fread_string(FILE* fp, std::string& out) {
+        uint32_t len = 0;
+        if (!fread_u32(fp, len) || len > MAX_STRING_BYTES) return false;
+        out.assign(len, '\0');
+        return len == 0 || std::fread(out.data(), 1, len, fp) == len;
     }
 
     static bool fread_fragments(FILE* fp, std::vector<DocFragment>& frags) {
-        uint32_t n = fread_u32(fp);
+        uint32_t n = 0;
+        if (!fread_u32(fp, n) || n > MAX_FRAGMENTS) return false;
         frags.resize(n);
         for (uint32_t i = 0; i < n; ++i) {
-            frags[i].content    = fread_string(fp);
-            frags[i].file       = fread_string(fp);
-            frags[i].line_start = static_cast<int>(fread_u32(fp));
-            frags[i].line_end   = static_cast<int>(fread_u32(fp));
+            uint32_t start = 0, end = 0;
+            if (!fread_string(fp, frags[i].content) || !fread_string(fp, frags[i].file) ||
+                !fread_u32(fp, start) || !fread_u32(fp, end) || start > static_cast<uint32_t>(INT_MAX) || end > static_cast<uint32_t>(INT_MAX)) return false;
+            frags[i].line_start = static_cast<int>(start);
+            frags[i].line_end   = static_cast<int>(end);
         }
         return std::ferror(fp) == 0;
     }
 
     static bool fread_tokenized(FILE* fp, std::vector<std::vector<std::string>>& docs) {
-        uint32_t n = fread_u32(fp);
+        uint32_t n = 0;
+        if (!fread_u32(fp, n) || n > MAX_FRAGMENTS) return false;
         docs.resize(n);
         for (uint32_t i = 0; i < n; ++i) {
-            uint32_t m = fread_u32(fp);
+            uint32_t m = 0;
+            if (!fread_u32(fp, m) || m > MAX_TOKENS_PER_DOC) return false;
             docs[i].resize(m);
             for (uint32_t j = 0; j < m; ++j)
-                docs[i][j] = fread_string(fp);
+                if (!fread_string(fp, docs[i][j])) return false;
         }
         return std::ferror(fp) == 0;
     }
 
     static bool fread_bm25(FILE* fp, BM25State& s) {
-        uint32_t dl_n = fread_u32(fp);
+        uint32_t dl_n = 0;
+        if (!fread_u32(fp, dl_n) || dl_n > MAX_FRAGMENTS) return false;
         s.doc_lengths.resize(dl_n);
-        for (uint32_t i = 0; i < dl_n; ++i)
-            s.doc_lengths[i] = static_cast<int>(fread_u32(fp));
+        for (uint32_t i = 0; i < dl_n; ++i) {
+            uint32_t length = 0;
+            if (!fread_u32(fp, length) || length > static_cast<uint32_t>(INT_MAX)) return false;
+            s.doc_lengths[i] = static_cast<int>(length);
+        }
 
-        s.avg_dl = fread_double(fp);
+        if (!fread_double(fp, s.avg_dl) || s.avg_dl < 0.0) return false;
 
-        uint32_t idf_n = fread_u32(fp);
+        uint32_t idf_n = 0;
+        if (!fread_u32(fp, idf_n) || idf_n > MAX_INDEX_TERMS) return false;
         s.idf.reserve(idf_n);
         for (uint32_t i = 0; i < idf_n; ++i) {
-            std::string term = fread_string(fp);
-            double val = fread_double(fp);
+            std::string term;
+            double val = 0.0;
+            if (!fread_string(fp, term) || !fread_double(fp, val)) return false;
             s.idf[std::move(term)] = val;
         }
 
-        uint32_t inv_n = fread_u32(fp);
+        uint32_t inv_n = 0;
+        if (!fread_u32(fp, inv_n) || inv_n > MAX_INDEX_TERMS) return false;
         s.inverted_index.reserve(inv_n);
         for (uint32_t i = 0; i < inv_n; ++i) {
-            std::string term = fread_string(fp);
-            uint32_t post_n = fread_u32(fp);
+            std::string term;
+            uint32_t post_n = 0;
+            if (!fread_string(fp, term) || !fread_u32(fp, post_n) || post_n > MAX_POSTINGS_PER_TERM) return false;
             std::vector<BM25Engine::Posting> postings(post_n);
             for (uint32_t j = 0; j < post_n; ++j) {
-                postings[j].doc_id = static_cast<size_t>(fread_u64(fp));
-                postings[j].tf     = static_cast<int>(fread_u32(fp));
+                uint64_t doc_id = 0;
+                uint32_t tf = 0;
+                if (!fread_u64(fp, doc_id) || !fread_u32(fp, tf) || doc_id > static_cast<uint64_t>(std::numeric_limits<size_t>::max()) || tf > static_cast<uint32_t>(INT_MAX)) return false;
+                postings[j].doc_id = static_cast<size_t>(doc_id);
+                postings[j].tf     = static_cast<int>(tf);
             }
             s.inverted_index[std::move(term)] = std::move(postings);
         }

@@ -2,6 +2,8 @@
 
 #include <filesystem>
 #include <fstream>
+#include <cctype>
+#include <optional>
 #include <string>
 #include <string_view>
 
@@ -20,6 +22,44 @@
 #endif
 
 namespace mcdk::path {
+
+inline std::filesystem::path from_utf8(std::string_view text);
+
+// Resolve an existing user supplied path without allowing it to escape root.
+// `std::filesystem::path::is_absolute()` is platform dependent, therefore the
+// textual Windows forms are rejected explicitly on every platform as well.
+inline std::optional<std::filesystem::path> resolve_existing_within_root(
+    const std::filesystem::path& root, std::string_view user_path, std::string* error = nullptr) {
+    auto fail = [&](const char* message) -> std::optional<std::filesystem::path> {
+        if (error) *error = message;
+        return std::nullopt;
+    };
+    if (root.empty()) return fail("knowledge root is unavailable");
+    if (user_path.empty()) return fail("path is required");
+
+    std::string normalized(user_path);
+    for (char& c : normalized) if (c == '\\') c = '/';
+    if (normalized.rfind("//", 0) == 0 ||
+        (normalized.size() >= 2 && std::isalpha(static_cast<unsigned char>(normalized[0])) && normalized[1] == ':'))
+        return fail("absolute and drive paths are not allowed");
+
+    const auto relative = from_utf8(normalized);
+    if (relative.is_absolute()) return fail("absolute paths are not allowed");
+
+    std::error_code ec;
+    const auto canonical_root = std::filesystem::weakly_canonical(root, ec);
+    if (ec || !std::filesystem::is_directory(canonical_root, ec)) return fail("knowledge root is unavailable");
+    const auto candidate = std::filesystem::weakly_canonical(canonical_root / relative, ec);
+    if (ec || !std::filesystem::exists(candidate, ec)) return fail("path does not exist");
+
+    auto root_it = canonical_root.begin();
+    auto candidate_it = candidate.begin();
+    for (; root_it != canonical_root.end(); ++root_it, ++candidate_it) {
+        if (candidate_it == candidate.end() || *root_it != *candidate_it)
+            return fail("path escapes knowledge root");
+    }
+    return candidate;
+}
 
 // 约定：模块内部尽量传 path，只有日志/协议边界再转 UTF-8 string。
 inline std::filesystem::path from_utf8(std::string_view text) {

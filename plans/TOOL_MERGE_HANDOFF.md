@@ -1,5 +1,9 @@
 # MCDK MCP Tool 合并优化交接说明
 
+> 2026-07-23 后续审查发现：单一 command 入口、MCP 返回契约、检索融合、
+> 路径边界、缓存失效和自动评估仍需系统加固。完整问题清单与实施计划见
+> [`minecraft-docs-retrieval-hardening-plan.md`](minecraft-docs-retrieval-hardening-plan.md)。
+
 ## 2026-06-24 后续更新
 
 统一资料入口工具已从 `minecraft_dev` 更名为 `minecraft_docs`。

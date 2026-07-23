@@ -215,8 +215,8 @@ def run_client(client_id: int, stop_event: threading.Event):
         t0 = time.time()
         try:
             status = post_jsonrpc(msg_url, "tools/call", {
-                "name":      "search_all",
-                "arguments": {"keyword": keyword, "top_k": 1},
+                "name":      "minecraft_docs_search",
+                "arguments": {"query": keyword, "corpus": "auto", "limit": 1, "max_chars": 1200},
             }, req_id)
             req_id += 1
 

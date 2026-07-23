@@ -1,3 +1,6 @@
 ﻿add_subdirectory(mcdk-index-compiler)
-add_subdirectory(mcdk-search)
+option(MCDK_BUILD_SEARCH_TOOL "Build the optional FTXUI-based mcdk-search tool" ON)
+if(MCDK_BUILD_SEARCH_TOOL)
+    add_subdirectory(mcdk-search)
+endif()
 add_subdirectory(mcdk-python-review)

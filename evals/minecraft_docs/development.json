@@ -1,0 +1,8 @@
+[
+  {"id":"api-listen-event","question":"ListenForEvent","expected_corpora":["api","event"],"required_sources_or_symbols":["ListenForEvent"],"must_not_return":[]},
+  {"id":"wiki-custom-food","question":"custom food","expected_corpora":["wiki"],"required_sources_or_symbols":["Custom Food"],"must_not_return":[]},
+  {"id":"zh-custom-item","question":"自定义物品","expected_corpora":["wiki","dev"],"required_sources_or_symbols":[],"must_not_return":[]},
+  {"id":"mixed-event","question":"ListenForEvent 玩家出生","expected_corpora":["api","event"],"required_sources_or_symbols":["ListenForEvent"],"must_not_return":[]},
+  {"id":"assets-recipe","question":"recipe","expected_corpora":["assets"],"required_sources_or_symbols":[],"must_not_return":[]},
+  {"id":"missing-symbol","question":"ThisInterfaceDoesNotExistXyz123","expected_corpora":[],"required_sources_or_symbols":[],"must_not_return":["status: ok"]}
+]

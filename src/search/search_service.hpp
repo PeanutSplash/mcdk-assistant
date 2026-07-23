@@ -38,6 +38,7 @@ public:
                   const std::filesystem::path& cache_path = {},
                   bool force_rebuild_cache = false)
         : jieba_(search_text::make_jieba(dicts_dir))
+        , dicts_dir_(dicts_dir)
         , knowledge_dir_(knowledge_dir)
         , cache_path_(cache_path)
         , force_rebuild_cache_(force_rebuild_cache)
@@ -52,6 +53,7 @@ public:
                   const std::filesystem::path& cache_path,
                   bool cache_only)
         : jieba_(search_text::make_jieba(dicts_dir))
+        , dicts_dir_(dicts_dir)
         , cache_path_(cache_path)
         , force_rebuild_cache_(false)
         , cache_only_mode_(cache_only)
@@ -61,12 +63,13 @@ public:
     }
 
     bool is_cache_only_mode() const { return cache_only_mode_; }
+    bool has_reliable_identifier_match(const std::string& keyword) const { return has_identifier_match(keyword); }
 
     std::vector<SearchResult> search_api(const std::string& keyword, int top_k = -1) const {
         return search_category_flexible(api_index_, keyword, top_k, SearchMode::Auto);
     }
     std::vector<SearchResult> search_event(const std::string& keyword, int top_k = -1) const {
-        if (looks_english_query(keyword) && !is_precise_identifier_query(keyword)) {
+        if (is_precise_identifier_query(keyword)) {
             const int limited_top_k = top_k > 0 ? std::min(top_k, 8) : 8;
             return search_event_keyword_index(keyword, limited_top_k);
         }
@@ -91,22 +94,27 @@ public:
         auto f = search_netease_guide(keyword, per_bucket_k);
         auto g = search_bedrock_dev(keyword, per_bucket_k);
 
+        // Scores from independent BM25/identifier indices are not comparable.
+        // Fuse only per-corpus ranks using RRF so a symbol score cannot drown
+        // out a relevant tutorial from another corpus.
+        std::unordered_map<const DocFragment*, double> fused;
+        constexpr double kRrf = 60.0;
+        auto add_ranked = [&](const std::vector<SearchResult>& bucket) {
+            for (size_t i = 0; i < bucket.size(); ++i) {
+                if (bucket[i].fragment) fused[bucket[i].fragment] += 1.0 / (kRrf + static_cast<double>(i + 1));
+            }
+        };
+        add_ranked(a); add_ranked(b); add_ranked(c); add_ranked(d);
+        add_ranked(e); add_ranked(f); add_ranked(g);
         std::vector<SearchResult> merged;
-        merged.reserve(a.size() + b.size() + c.size() + d.size() + e.size() + f.size() + g.size());
-        merged.insert(merged.end(), a.begin(), a.end());
-        merged.insert(merged.end(), b.begin(), b.end());
-        merged.insert(merged.end(), c.begin(), c.end());
-        merged.insert(merged.end(), d.begin(), d.end());
-        merged.insert(merged.end(), e.begin(), e.end());
-        merged.insert(merged.end(), f.begin(), f.end());
-        merged.insert(merged.end(), g.begin(), g.end());
-
+        merged.reserve(fused.size());
+        for (const auto& [fragment, score] : fused) merged.push_back({fragment, score});
         std::sort(merged.begin(), merged.end(), [](const SearchResult& x, const SearchResult& y) {
-            return x.score != y.score ? x.score > y.score : x.fragment->file < y.fragment->file;
+            if (x.score != y.score) return x.score > y.score;
+            if (x.fragment->file != y.fragment->file) return x.fragment->file < y.fragment->file;
+            return x.fragment->line_start < y.fragment->line_start;
         });
-
-        if (top_k > 0 && static_cast<size_t>(top_k) < merged.size()) merged.resize(static_cast<size_t>(top_k));
-        return merged;
+        return diversify_results(std::move(merged), top_k);
     }
     std::vector<SearchResult> search_wiki(const std::string& keyword, int top_k = -1) const {
         return search_category_en(wiki_index_, keyword, top_k);
@@ -134,37 +142,11 @@ public:
     FileReadResult read_cached_file(const std::string& rel_path, int line_start = 1, int line_end = INT_MAX) const {
         FileReadResult result;
         std::string full_content;
-        bool found = false;
-
-        auto collect = [&](const CategoryIndex& idx) {
-            for (const auto& frag : idx.fragments) {
-                if (frag.file == rel_path) {
-                    full_content += frag.content;
-                    found = true;
-                }
-            }
-        };
-
-        collect(api_index_);
-        collect(event_index_);
-        collect(enum_index_);
-        collect(wiki_index_);
-        collect(bedrockdev_index_);
-        collect(qumod_index_);
-        collect(netease_guide_index_);
-
-        auto collect_ga = [&](const GameAssetIndex& idx) {
-            for (const auto& frag : idx.fragments) {
-                if (frag.file == rel_path) {
-                    full_content += frag.content;
-                    found = true;
-                }
-            }
-        };
-        collect_ga(game_assets_bp_);
-        collect_ga(game_assets_rp_);
-
-        if (!found) return result;
+        const auto found = cached_file_fragments_.find(rel_path);
+        if (found == cached_file_fragments_.end()) return result;
+        for (const auto* fragment : found->second) {
+            if (fragment) full_content += fragment->content;
+        }
 
         result.found = true;
 
@@ -177,9 +159,10 @@ public:
         while (std::getline(iss, line)) {
             ++cur;
             if (cur < line_start) continue;
-            if (cur > line_end) break;
-            result.content += line;
-            result.content += '\n';
+            if (cur <= line_end) {
+                result.content += line;
+                result.content += '\n';
+            }
         }
         result.total_lines = cur;
         return result;
@@ -201,45 +184,13 @@ public:
             if (prefix.back() != '/') prefix += '/';
         }
 
-        auto collect = [&](const std::vector<DocFragment>& frags) {
-            for (const auto& frag : frags) {
-                const std::string& file = frag.file;
-                if (!prefix.empty() && file.find(prefix) != 0) continue;
-                std::string remainder = file.substr(prefix.size());
-                auto slash_pos = remainder.find('/');
-                if (slash_pos != std::string::npos) {
-                    dir_set.insert(remainder.substr(0, slash_pos));
-                } else if (!remainder.empty()) {
-                    file_set.insert(remainder);
-                }
-            }
-        };
-
-        collect(api_index_.fragments);
-        collect(event_index_.fragments);
-        collect(enum_index_.fragments);
-        collect(wiki_index_.fragments);
-        collect(bedrockdev_index_.fragments);
-        collect(qumod_index_.fragments);
-        collect(netease_guide_index_.fragments);
-        collect(game_assets_bp_.fragments);
-        collect(game_assets_rp_.fragments);
-
-        auto collect_ga_paths = [&](const GameAssetIndex& idx) {
-            for (const auto& entry : idx.path_entries) {
-                const std::string& file = entry.first;
-                if (!prefix.empty() && file.find(prefix) != 0) continue;
-                std::string remainder = file.substr(prefix.size());
-                auto slash_pos = remainder.find('/');
-                if (slash_pos != std::string::npos) {
-                    dir_set.insert(remainder.substr(0, slash_pos));
-                } else if (!remainder.empty()) {
-                    file_set.insert(remainder);
-                }
-            }
-        };
-        collect_ga_paths(game_assets_bp_);
-        collect_ga_paths(game_assets_rp_);
+        for (const auto& [file, _] : cached_file_fragments_) {
+            if (!prefix.empty() && file.rfind(prefix, 0) != 0) continue;
+            std::string remainder = file.substr(prefix.size());
+            auto slash_pos = remainder.find('/');
+            if (slash_pos != std::string::npos) dir_set.insert(remainder.substr(0, slash_pos));
+            else if (!remainder.empty()) file_set.insert(remainder);
+        }
 
         result.dirs.assign(dir_set.begin(), dir_set.end());
         result.files.assign(file_set.begin(), file_set.end());
@@ -380,6 +331,7 @@ private:
 
     std::unique_ptr<cppjieba::Jieba> jieba_;
     std::filesystem::path           knowledge_dir_;
+    std::filesystem::path           dicts_dir_;
     std::filesystem::path           cache_path_;
     bool                            force_rebuild_cache_ = false;
     bool                            cache_only_mode_ = false;
@@ -394,6 +346,7 @@ private:
     GameAssetIndex                  game_assets_bp_;
     GameAssetIndex                  game_assets_rp_;
     std::vector<EventKeywordEntry>  event_keyword_entries_;
+    std::unordered_map<std::string, std::vector<const DocFragment*>> cached_file_fragments_;
 
     void init_indices() {
         if (cache_only_mode_) {
@@ -413,7 +366,7 @@ private:
 
         if (!cache_path_.empty() && !force_rebuild_cache_) {
             // 有缓存时优先走恢复路径，避免每次启动都重新构建 BM25。
-            std::string fp = IndexCache::compute_fingerprint(knowledge_dir_);
+            std::string fp = IndexCache::compute_fingerprint(knowledge_dir_, dicts_dir_);
             std::cerr << "[MCDK] knowledge fingerprint: " << fp << std::endl;
 
             IndexCache::CacheData cached;
@@ -432,6 +385,7 @@ private:
         }
         load_knowledge_parallel();
         build_indices();
+        rebuild_cached_file_lookup();
 
         if (!cache_path_.empty()) {
             save_cache();  // save_cache() 内部已释放 tokenized_docs
@@ -501,15 +455,32 @@ private:
 
         rebuild_event_keyword_entries();
         rebuild_cn_identifier_entries();
+        rebuild_cached_file_lookup();
 
         // CacheData 析构时 categories/game_assets 里剩余的临时内存自动释放
         std::cerr << "[MCDK] 缓存恢复完成: " << doc_count() << " fragments, "
                   << game_assets_count() << " game assets" << std::endl;
     }
 
+    void rebuild_cached_file_lookup() {
+        cached_file_fragments_.clear();
+        auto add = [&](const std::vector<DocFragment>& fragments) {
+            for (const auto& fragment : fragments)
+                cached_file_fragments_[fragment.file].push_back(&fragment);
+        };
+        add(api_index_.fragments); add(event_index_.fragments); add(enum_index_.fragments);
+        add(wiki_index_.fragments); add(bedrockdev_index_.fragments); add(qumod_index_.fragments);
+        add(netease_guide_index_.fragments); add(game_assets_bp_.fragments); add(game_assets_rp_.fragments);
+        for (auto& [_, fragments] : cached_file_fragments_) {
+            std::sort(fragments.begin(), fragments.end(), [](const auto* lhs, const auto* rhs) {
+                return lhs->line_start < rhs->line_start;
+            });
+        }
+    }
+
     // 保存缓存：GameAssets 只存 rel_path，content 通过 fragments 序列化（去掉重复）
     void save_cache() {
-        std::string fp = IndexCache::compute_fingerprint(knowledge_dir_);
+        std::string fp = IndexCache::compute_fingerprint(knowledge_dir_, dicts_dir_);
 
         // 提取 GA 的 rel_path 列表（从 path_entries 取原始路径）
         std::vector<std::string> bp_rel_paths, rp_rel_paths;
@@ -574,7 +545,7 @@ private:
                                                        const std::string& keyword,
                                                        int top_k,
                                                        SearchMode mode) const {
-        if (looks_english_query(keyword)) {
+        if (is_precise_identifier_query(keyword)) {
             auto identifier_hits = search_identifier_index(idx, keyword, top_k > 0 ? top_k : 8);
             if (!identifier_hits.empty()) {
                 if (top_k <= 0 || identifier_hits.size() >= static_cast<size_t>(top_k)) return identifier_hits;
@@ -596,6 +567,29 @@ private:
         std::vector<std::string> fallback_tokens = make_query_tokens(keyword, mode, true);
         if (fallback_tokens == primary_tokens) return results;
         return idx.engine.search(fallback_tokens, top_k);
+    }
+
+    static std::vector<SearchResult> diversify_results(std::vector<SearchResult> ranked, int top_k) {
+        const size_t desired = top_k > 0 ? static_cast<size_t>(top_k) : ranked.size();
+        std::vector<SearchResult> selected;
+        selected.reserve(std::min(desired, ranked.size()));
+        std::unordered_set<std::string> seen_files;
+        auto is_index_page = [](const std::string& file) {
+            const auto slash = file.find_last_of("/\\");
+            const std::string name = file.substr(slash == std::string::npos ? 0 : slash + 1);
+            return name == "index.md" || name == "Index.md" || name == "索引.md" || name == "Api索引表.md";
+        };
+        // Prefer one detailed page per file and delay navigation/index pages.
+        for (int pass = 0; pass < 2 && selected.size() < desired; ++pass) {
+            for (const auto& result : ranked) {
+                if (!result.fragment || seen_files.count(result.fragment->file)) continue;
+                if ((pass == 0) != !is_index_page(result.fragment->file)) continue;
+                seen_files.insert(result.fragment->file);
+                selected.push_back(result);
+                if (selected.size() == desired) break;
+            }
+        }
+        return selected;
     }
 
     static void append_unique_results(std::vector<SearchResult>& dst,
@@ -736,14 +730,33 @@ private:
         return results;
     }
 
+    bool has_identifier_match(const std::string& keyword) const {
+        if (!is_precise_identifier_query(keyword)) return true;
+        const auto matches = [&](const CategoryIndex& idx) {
+            std::vector<std::string> terms;
+            tokenize_en(keyword, terms);
+            for (const auto& raw : terms) {
+                const auto term = compact_ascii_identifier(raw);
+                if (term.empty()) continue;
+                if (idx.identifier_exact_index.count(term)) return true;
+                for (const auto& entry : idx.identifier_entries) {
+                    if (entry.identifier_compact.rfind(term, 0) == 0) return true;
+                }
+            }
+            return false;
+        };
+        return matches(api_index_) || matches(event_index_) || matches(enum_index_) || matches(qumod_index_) || matches(netease_guide_index_);
+    }
+
     std::vector<std::string> make_query_tokens(const std::string& text,
                                                SearchMode mode,
                                                bool fallback_phase) const {
         std::vector<std::string> tokens;
 
+        const bool has_ascii = std::any_of(text.begin(), text.end(), [](unsigned char c) { return std::isalnum(c) || c == '_'; });
         const bool prefer_english = mode == SearchMode::EnglishOnly
             || (mode == SearchMode::PreferEnglishFallback && fallback_phase)
-            || (mode == SearchMode::Auto && looks_english_query(text));
+            || (mode == SearchMode::Auto && (looks_english_query(text) || has_ascii));
 
         const bool prefer_chinese = mode == SearchMode::ChineseOnly
             || (mode == SearchMode::PreferEnglishFallback && !fallback_phase)
@@ -751,6 +764,14 @@ private:
 
         if (prefer_chinese) {
             tokenize(text, tokens);
+            // Mixed queries need both CJK terms and ASCII identifiers.  Jieba
+            // alone can otherwise discard the code-shaped part.
+            if (has_ascii) {
+                std::vector<std::string> english;
+                tokenize_en(text, english);
+                tokens.insert(tokens.end(), english.begin(), english.end());
+                search_text::normalize_tokens(tokens);
+            }
             if (!tokens.empty()) return tokens;
             if (mode == SearchMode::ChineseOnly) return tokens;
         }
@@ -772,16 +793,18 @@ private:
         if (text.empty()) return false;
         bool has_upper = false;
         bool has_lower = false;
+        bool has_symbol_separator = false;
         size_t alpha_count = 0;
         for (unsigned char c : text) {
-            if (!std::isalnum(c) && c != '_') return false;
+            if (!std::isalnum(c) && c != '_' && c != ':' && c != '.') return false;
+            if (c == ':' || c == '.') has_symbol_separator = true;
             if (std::isalpha(c)) {
                 ++alpha_count;
                 if (std::isupper(c)) has_upper = true;
                 if (std::islower(c)) has_lower = true;
             }
         }
-        return alpha_count >= 12 && has_upper && has_lower;
+        return alpha_count >= 3 && (has_symbol_separator || (has_upper && has_lower));
     }
 
     static std::string to_ascii_lower(const std::string& text) {
@@ -968,6 +991,8 @@ private:
             if (ext == ".md" || ext == ".MD")
                 md_files.push_back({entry.path(), rel_path});
         }
+        std::sort(md_files.begin(), md_files.end(), [](const auto& lhs, const auto& rhs) { return lhs.second < rhs.second; });
+        std::sort(ga_files.begin(), ga_files.end(), [](const auto& lhs, const auto& rhs) { return lhs.second < rhs.second; });
 
         std::cerr << "[MCDK] 扫描完成: " << md_files.size() << " md, "
                   << ga_files.size() << " game asset 文件" << std::endl;
@@ -1015,6 +1040,14 @@ private:
         }
         for (auto& f : futures) f.get();
 
+        // Worker completion order must not change index order or tie-breaking.
+        auto sort_game_assets = [](GameAssetIndex& idx) {
+            std::sort(idx.path_entries.begin(), idx.path_entries.end(), [](const auto& lhs, const auto& rhs) { return lhs.first < rhs.first; });
+            std::sort(idx.fragments.begin(), idx.fragments.end(), [](const auto& lhs, const auto& rhs) { return lhs.file < rhs.file; });
+        };
+        sort_game_assets(game_assets_bp_);
+        sort_game_assets(game_assets_rp_);
+
         // jieba 相关分词阶段仍保持单线程，减少额外同步复杂度。
         for (const auto& [abs_path, rel_path] : md_files)
             load_markdown_file(abs_path, rel_path);
@@ -1035,6 +1068,8 @@ private:
         std::ostringstream current_content;
         int fragment_start = 1, line_num = 0;
         bool has_content = false;
+        std::string inherited_heading;
+        static constexpr size_t kMaxFragmentChars = 4000;
 
         auto flush_fragment = [&]() {
             std::string content = current_content.str();
@@ -1052,10 +1087,24 @@ private:
             if (line.size() >= 2 && line[0] == '#') {
                 size_t level = 0;
                 while (level < line.size() && line[level] == '#') ++level;
-                if (level >= 2 && level <= 4) { flush_fragment(); fragment_start = line_num; }
+                if (level >= 2 && level <= 4) {
+                    flush_fragment();
+                    fragment_start = line_num;
+                    inherited_heading = line;
+                }
             }
             current_content << line << "\n";
             if (!line.empty()) has_content = true;
+            // A large section is split at line boundaries.  The next fragment
+            // inherits the parent heading so isolated examples stay searchable.
+            if (current_content.tellp() >= static_cast<std::streampos>(kMaxFragmentChars)) {
+                flush_fragment();
+                fragment_start = line_num + 1;
+                if (!inherited_heading.empty()) {
+                    current_content << inherited_heading << "\n";
+                    has_content = true;
+                }
+            }
         }
         flush_fragment();
     }

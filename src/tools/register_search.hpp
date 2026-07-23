@@ -18,7 +18,9 @@
 #include <mcp_message.h>
 #include <fstream>
 #include <climits>
+#include <algorithm>
 #include <filesystem>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -28,41 +30,135 @@ namespace mcdk {
 
 using SearchFn = std::vector<SearchResult>(SearchService::*)(const std::string&, int) const;
 
+inline std::string docs_ref(const std::string& file, int line_start, int line_end) {
+    std::string normalized = file;
+    for (char& c : normalized) if (c == '\\') c = '/';
+    return "mcdk://knowledge/" + normalized + "#L" + std::to_string(line_start) + "-L" + std::to_string(line_end);
+}
+
+inline bool is_safe_relative_docs_path(const std::string& input) {
+    if (input.empty()) return false;
+    std::string value = input;
+    for (char& c : value) if (c == '\\') c = '/';
+    if (value.rfind("//", 0) == 0 || value.front() == '/' ||
+        (value.size() >= 2 && std::isalpha(static_cast<unsigned char>(value[0])) && value[1] == ':')) return false;
+    const auto path = mcdk::path::from_utf8(value).lexically_normal();
+    return std::none_of(path.begin(), path.end(), [](const auto& part) { return part == ".."; });
+}
+
+inline std::string docs_title(const DocFragment& fragment) {
+    std::istringstream input(fragment.content);
+    std::string line;
+    while (std::getline(input, line)) {
+        const auto start = line.find_first_not_of(" \t#");
+        if (!line.empty() && line[0] == '#' && start != std::string::npos) return line.substr(start);
+    }
+    return fragment.file;
+}
+
+inline std::string docs_preview(const std::string& content, size_t max_chars) {
+    std::string body = content;
+    if (body.rfind("---\n", 0) == 0) {
+        const auto front_matter_end = body.find("\n---", 4);
+        if (front_matter_end != std::string::npos) body.erase(0, front_matter_end + 4);
+    }
+    const auto begin = body.find_first_not_of("\r\n \t");
+    if (begin != std::string::npos) body.erase(0, begin);
+    if (body.size() > max_chars) return body.substr(0, max_chars) + "\n…";
+    return body;
+}
+
+inline mcp::json docs_error(const std::string& message) {
+    return {{"isError", true}, {"content", mcp::json::array({{{"type", "text"}, {"text", message}}})},
+            {"structuredContent", {{"status", "invalid_request"}, {"message", message}}}};
+}
+
+inline mcp::json render_search_response(const std::string& query, const std::string& corpus,
+                                        const std::vector<SearchResult>& results, int max_chars = 6000) {
+    max_chars = std::clamp(max_chars, 512, 20000);
+    mcp::json hits = mcp::json::array();
+    std::string text;
+    int remaining = max_chars;
+    int rank = 0;
+    bool truncated = false;
+    for (const auto& result : results) {
+        if (!result.fragment || remaining < 96) { truncated = true; break; }
+        const auto& fragment = *result.fragment;
+        const auto ref = docs_ref(fragment.file, fragment.line_start, fragment.line_end);
+        const auto title = docs_title(fragment);
+        const std::string header = "[" + std::to_string(++rank) + "] " + title + "\nsource: " + fragment.file + ":" +
+            std::to_string(fragment.line_start) + "-" + std::to_string(fragment.line_end) + "\nref: " + ref + "\nmatch: lexical\n\n";
+        const size_t preview_budget = remaining > static_cast<int>(header.size()) ?
+            static_cast<size_t>(remaining - static_cast<int>(header.size())) : 0;
+        const auto preview = docs_preview(fragment.content, std::min<size_t>(1200, preview_budget));
+        const bool hit_truncated = preview.size() < fragment.content.size();
+        const std::string entry = header + preview + (hit_truncated ? "\n[truncated; call minecraft_docs_read with the ref above]" : "") + "\n\n";
+        if (static_cast<int>(entry.size()) > remaining && rank > 1) { --rank; truncated = true; break; }
+        text += entry;
+        remaining -= static_cast<int>(entry.size());
+        hits.push_back({{"rank", rank}, {"title", title}, {"corpus", corpus}, {"file", fragment.file},
+                        {"line_start", fragment.line_start}, {"line_end", fragment.line_end}, {"ref", ref},
+                        {"match_type", "lexical"}, {"preview", preview}, {"has_more", hit_truncated}});
+        truncated = truncated || hit_truncated;
+    }
+    if (hits.empty()) {
+        text = "No reliable documentation match found for: " + query + ". Try a symbol name, a more specific feature, or another corpus.";
+        return {{"content", mcp::json::array({{{"type", "text"}, {"text", text}}})},
+                {"structuredContent", {{"query", query}, {"status", "not_found"}, {"truncated", false}, {"hits", hits}}}};
+    }
+    return {{"content", mcp::json::array({{{"type", "text"}, {"text", text}}})},
+            {"structuredContent", {{"query", query}, {"status", "ok"}, {"truncated", truncated}, {"hits", hits}}}};
+}
+
 // ── 文档检索 handler（按 SearchFn 选择分区/聚合搜索）──
 inline mcp::json handle_search(SearchService& svc, SearchFn fn, const mcp::json& params) {
     std::string keyword = params.value("keyword", "");
-    if (keyword.empty())
-        throw mcp::mcp_exception(mcp::error_code::invalid_params, "keyword is required");
+    if (keyword.empty()) return docs_error("query is required");
     int top_k = params.contains("top_k") && !params["top_k"].is_null()
         ? params["top_k"].get<int>() : 6;
 
-    auto results = (svc.*fn)(keyword, top_k);
-
-    mcp::json arr = mcp::json::array();
-    for (const auto& r : results)
-        arr.push_back({{"type","text"},{"text",r.fragment->content},
-            {"file",r.fragment->file},{"line_start",r.fragment->line_start},
-            {"line_end",r.fragment->line_end},{"score",r.score}});
-    return {{"content", arr}};
+    const int max_chars = params.value("max_chars", 6000);
+    if (!svc.has_reliable_identifier_match(keyword) && params.value("corpus", "auto") != "wiki" && params.value("corpus", "auto") != "dev")
+        return render_search_response(keyword, params.value("corpus", "auto"), {}, max_chars);
+    return render_search_response(keyword, params.value("corpus", "auto"), (svc.*fn)(keyword, top_k), max_chars);
 }
 
 // ── 原版游戏资产模糊搜索 handler ──
 // params: keyword(必填), scope(0=全部/1=行为包/2=资源包, 默认0), top_k(默认6)
 inline mcp::json handle_search_game_assets(SearchService& search_svc, const mcp::json& params) {
     std::string keyword = params.value("keyword", "");
-    if (keyword.empty())
-        throw mcp::mcp_exception(mcp::error_code::invalid_params, "keyword is required");
+    if (keyword.empty()) return docs_error("query is required");
     int scope = params.contains("scope") && !params["scope"].is_null()
         ? params["scope"].get<int>() : 0;
     int top_k = params.contains("top_k") && !params["top_k"].is_null()
         ? params["top_k"].get<int>() : 6;
 
     auto results = search_svc.search_game_assets(keyword, scope, top_k);
-    mcp::json arr = mcp::json::array();
-    for (const auto& r : results)
-        arr.push_back({{"type","text"},{"text",r.snippet},
-            {"file",r.rel_path},{"score",r.score}});
-    return {{"content", arr}};
+    mcp::json hits = mcp::json::array();
+    std::string text;
+    int rank = 0;
+    int remaining = std::clamp(params.value("max_chars", 6000), 512, 20000);
+    bool truncated = false;
+    for (const auto& r : results) {
+        const auto ref = docs_ref(r.rel_path, 1, 1);
+        ++rank;
+        std::string preview = r.snippet;
+        const std::string header = "[" + std::to_string(rank) + "] " + r.rel_path + "\nsource: " + r.rel_path + "\nref: " + ref + "\n\n";
+        if (static_cast<int>(header.size()) >= remaining) { --rank; truncated = true; break; }
+        if (static_cast<int>(header.size() + preview.size()) > remaining) {
+            preview.resize(static_cast<size_t>(remaining - static_cast<int>(header.size())));
+            truncated = true;
+        }
+        text += header + preview + "\n\n";
+        remaining -= static_cast<int>(header.size() + preview.size() + 2);
+        hits.push_back({{"rank", rank}, {"title", r.rel_path}, {"corpus", "assets"}, {"file", r.rel_path},
+                        {"line_start", 1}, {"line_end", 1}, {"ref", ref}, {"match_type", "path+body"},
+                        {"preview", preview}, {"has_more", true}});
+    }
+    const std::string status = hits.empty() ? "not_found" : "ok";
+    if (hits.empty()) text = "No matching game asset found for: " + keyword;
+    return {{"content", mcp::json::array({{{"type", "text"}, {"text", text}}})},
+            {"structuredContent", {{"query", keyword}, {"status", status}, {"truncated", truncated}, {"hits", hits}}}};
 }
 
 // ── 读取 knowledge 文件 handler ──
@@ -70,10 +166,8 @@ inline mcp::json handle_search_game_assets(SearchService& search_svc, const mcp:
 inline mcp::json handle_read_knowledge(const std::filesystem::path& knowledge_root,
                                        SearchService& search_svc, const mcp::json& params) {
     std::string rel = params.value("path", "");
-    if (rel.empty())
-        throw mcp::mcp_exception(mcp::error_code::invalid_params, "path is required");
-    if (rel.find("..") != std::string::npos)
-        throw mcp::mcp_exception(mcp::error_code::invalid_params, "path must not contain '..'");
+    if (rel.empty()) return docs_error("path is required");
+    if (!is_safe_relative_docs_path(rel)) return docs_error("invalid path: only relative paths within knowledge are allowed");
 
     int ls = params.contains("line_start") && !params["line_start"].is_null()
         ? params["line_start"].get<int>() : 1;
@@ -83,32 +177,43 @@ inline mcp::json handle_read_knowledge(const std::filesystem::path& knowledge_ro
     if (le < ls) le = ls;
 
     if (!knowledge_root.empty()) {
-        auto full = knowledge_root / mcdk::path::from_utf8(rel);
-        std::ifstream ifs(full);
+        std::string path_error;
+        auto full = mcdk::path::resolve_existing_within_root(knowledge_root, rel, &path_error);
+        if (!full) return docs_error("invalid path: " + path_error);
+        if (!std::filesystem::is_regular_file(*full)) return docs_error("path is not a regular file");
+        std::ifstream ifs(*full);
         if (ifs.is_open()) {
             std::string result, line; int cur = 0;
             while (std::getline(ifs, line)) {
                 ++cur;
                 if (cur < ls) continue;
-                if (cur > le) break;
-                result += line; result += '\n';
+                if (cur <= le) { result += line; result += '\n'; }
             }
-            return {{"content", mcp::json::array({
-                {{"type","text"},{"text",result},{"file",rel},
-                 {"line_start",ls},{"line_end",std::min(cur,le)},{"total_lines",cur}}
-            })}};
+            const int max_chars = std::clamp(params.value("max_chars", 8000), 512, 20000);
+            const bool has_more = cur > le || static_cast<int>(result.size()) > max_chars;
+            if (static_cast<int>(result.size()) > max_chars) result.resize(static_cast<size_t>(max_chars));
+            const int end = std::min(cur, le);
+            const int next = has_more ? end + 1 : 0;
+            const auto ref = docs_ref(rel, ls, end);
+            const std::string text = "source: " + rel + ":" + std::to_string(ls) + "-" + std::to_string(end) +
+                "\nref: " + ref + "\n\n" + result + (has_more ? "\n[truncated; call minecraft_docs_read with start_line=" + std::to_string(next) + "]" : "");
+            return {{"content", mcp::json::array({{{"type","text"},{"text",text}}})},
+                    {"structuredContent", {{"status", "ok"}, {"file", rel}, {"line_start", ls}, {"line_end", end},
+                        {"total_lines", cur}, {"ref", ref}, {"content", result}, {"has_more", has_more}, {"next_start", next}}}};
         }
     }
 
     auto cached_result = search_svc.read_cached_file(rel, ls, le);
-    if (!cached_result.found)
-        throw mcp::mcp_exception(mcp::error_code::invalid_params, "file not found: " + rel);
+    if (!cached_result.found) return docs_error("file not found: " + rel);
 
-    return {{"content", mcp::json::array({
-        {{"type","text"},{"text",cached_result.content},{"file",rel},
-         {"line_start",ls},{"line_end",std::min(cached_result.total_lines,le)},
-         {"total_lines",cached_result.total_lines},{"source","cache"}}
-    })}};
+    const int max_chars = std::clamp(params.value("max_chars", 8000), 512, 20000);
+    if (static_cast<int>(cached_result.content.size()) > max_chars) cached_result.content.resize(static_cast<size_t>(max_chars));
+    const int end = std::min(cached_result.total_lines, le);
+    const bool has_more = cached_result.total_lines > end || static_cast<int>(cached_result.content.size()) >= max_chars;
+    const auto ref = docs_ref(rel, ls, end);
+    return {{"content", mcp::json::array({{{"type","text"},{"text", "source: " + rel + ":" + std::to_string(ls) + "-" + std::to_string(end) + "\nref: " + ref + "\n\n" + cached_result.content}}})},
+            {"structuredContent", {{"status", "ok"}, {"file", rel}, {"line_start", ls}, {"line_end", end},
+                {"total_lines", cached_result.total_lines}, {"ref", ref}, {"content", cached_result.content}, {"has_more", has_more}, {"next_start", has_more ? end + 1 : 0}, {"source", "cache"}}}};
 }
 
 // ── 列出 knowledge 目录 handler ──
@@ -116,14 +221,20 @@ inline mcp::json handle_list_knowledge(const std::filesystem::path& knowledge_ro
                                        SearchService& search_svc, const mcp::json& params) {
     namespace fs = std::filesystem;
     std::string rel = params.value("path", "");
-    if (rel.find("..") != std::string::npos)
-        throw mcp::mcp_exception(mcp::error_code::invalid_params, "path must not contain '..'");
+    if (!rel.empty() && !is_safe_relative_docs_path(rel)) return docs_error("invalid path: only relative paths within knowledge are allowed");
 
     if (!knowledge_root.empty()) {
-        fs::path dir = knowledge_root / (rel.empty() ? fs::path() : mcdk::path::from_utf8(rel));
-        if (fs::exists(dir) && fs::is_directory(dir)) {
+        if (rel.empty()) {
+            // Root listing is the only deliberate empty-path operation.
+            rel = "";
+        }
+        std::string path_error;
+        auto dir = rel.empty() ? std::optional<fs::path>(fs::weakly_canonical(knowledge_root))
+                               : mcdk::path::resolve_existing_within_root(knowledge_root, rel, &path_error);
+        if (!dir) return docs_error("invalid path: " + path_error);
+        if (fs::is_directory(*dir)) {
             mcp::json dirs = mcp::json::array(), files = mcp::json::array();
-            for (const auto& entry : fs::directory_iterator(dir)) {
+            for (const auto& entry : fs::directory_iterator(*dir)) {
                 std::string s = mcdk::path::filename_to_utf8(entry.path());
                 if (entry.is_directory()) dirs.push_back(s);
                 else files.push_back(s);
@@ -131,18 +242,20 @@ inline mcp::json handle_list_knowledge(const std::filesystem::path& knowledge_ro
             std::string text = "目录: " + (rel.empty() ? "/" : rel) + "\n";
             for (const auto& d : dirs)  text += "[DIR]  " + d.get<std::string>() + "\n";
             for (const auto& f : files) text += "       " + f.get<std::string>() + "\n";
-            return {{"content", mcp::json::array({{{"type","text"},{"text",text}}})}};
+            return {{"content", mcp::json::array({{{"type","text"},{"text",text}}})},
+                    {"structuredContent", {{"status", "ok"}, {"path", rel}, {"dirs", dirs}, {"files", files}}}};
         }
+        return docs_error("path is not a directory");
     }
 
     auto cached_list = search_svc.list_cached_files(rel);
-    if (!cached_list.found)
-        throw mcp::mcp_exception(mcp::error_code::invalid_params, "directory not found: " + rel);
+    if (!cached_list.found) return docs_error("directory not found: " + rel);
 
     std::string text = "目录: " + (rel.empty() ? "/" : rel) + " (from cache)\n";
     for (const auto& d : cached_list.dirs)  text += "[DIR]  " + d + "\n";
     for (const auto& f : cached_list.files) text += "       " + f + "\n";
-    return {{"content", mcp::json::array({{{"type","text"},{"text",text}}})}};
+    return {{"content", mcp::json::array({{{"type","text"},{"text",text}}})},
+            {"structuredContent", {{"status", "ok"}, {"path", rel}, {"dirs", cached_list.dirs}, {"files", cached_list.files}, {"source", "cache"}}}};
 }
 
 // ──────────────────────────────────────────────────────────────────────────

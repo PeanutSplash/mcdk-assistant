@@ -1,6 +1,15 @@
 cmake_minimum_required(VERSION 3.15)
 project(mcdk-tests LANGUAGES CXX)
 
+enable_testing()
+
+add_executable(minecraft_docs_hardening_test minecraft_docs_hardening_test.cpp)
+target_include_directories(minecraft_docs_hardening_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src
+)
+target_compile_features(minecraft_docs_hardening_test PRIVATE cxx_std_20)
+add_test(NAME minecraft_docs_hardening_test COMMAND minecraft_docs_hardening_test)
+
 add_executable(search_test search_test.cpp)
 
 add_executable(python_analysis_test
