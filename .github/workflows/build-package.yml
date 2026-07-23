@@ -55,12 +55,15 @@ jobs:
         run: |
           git submodule update --init --recursive solutions || true
 
+      # glibc 2.34 起 libdl 已并入 libc；2.31 上 pocketpy 的 dlopen/dlsym
+      # 仍需显式链接 -ldl。
       - name: Configure
         run: >
           cmake -S . -B build/ci
           -G Ninja
           -DCMAKE_BUILD_TYPE=Release
           -DCMAKE_INSTALL_PREFIX=${{ github.workspace }}/package
+          -DCMAKE_CXX_STANDARD_LIBRARIES=-ldl
           -DMCDK_BUILD_TESTS=ON
 
       - name: Build
