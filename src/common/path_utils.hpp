@@ -64,7 +64,8 @@ inline std::optional<std::filesystem::path> resolve_existing_within_root(
 // 约定：模块内部尽量传 path，只有日志/协议边界再转 UTF-8 string。
 inline std::filesystem::path from_utf8(std::string_view text) {
 #if defined(__cpp_lib_char8_t)
-    return std::filesystem::u8path(text);
+    const auto* begin = reinterpret_cast<const char8_t*>(text.data());
+    return std::filesystem::path(std::u8string(begin, begin + text.size()));
 #else
     return std::filesystem::u8path(text.begin(), text.end());
 #endif
