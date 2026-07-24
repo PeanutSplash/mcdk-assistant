@@ -172,3 +172,35 @@ jobs:
             --notes-file release-notes.md \
             --latest \
             mcdk-assistant-linux-x64.tar.gz
+
+  # 发布后经 Tailscale 连入内网、SSH 触发服务器立即拉取新构建（每日轮询仍作兜底）。
+  # 需仓库变量 SERVER_PUSH_UPDATE=true 才启用——配置齐全后再打开，避免半配置时 job 报错。
+  # 另需 secrets TS_OAUTH_CLIENT_ID / TS_OAUTH_SECRET，且 tailnet ACL 放通 tag:ci → 服务器 root。
+  trigger-update:
+    name: Trigger server update
+    needs: release
+    if: >
+      vars.SERVER_PUSH_UPDATE == 'true'
+      && ((github.event_name == 'push' && github.ref == 'refs/heads/main')
+          || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v3
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+
+      # Tailscale SSH 按 tailnet 身份鉴权，无需 SSH 私钥。服务器脚本自身幂等，
+      # 直接调用即可；下载走代理约 1-2 分钟，前台等待以便 CI 反映成败。
+      - name: Run the update on the server
+        run: |
+          set -euo pipefail
+          ok=0
+          for i in 1 2 3; do
+            if ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=25 -o BatchMode=yes \
+                 root@100.84.150.108 '/usr/local/sbin/mcdk-assistant-update'; then ok=1; break; fi
+            echo "SSH attempt $i failed; retrying in 5s..." >&2; sleep 5
+          done
+          [ "$ok" = 1 ]
