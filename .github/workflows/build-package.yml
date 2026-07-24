@@ -112,8 +112,63 @@ jobs:
           done
           exit $status
 
+      # 打成单个 tarball：既是 release 资产，也是交给 release job 的中间产物。
+      # -C package . 让归档在根部展开（dicts/、*.bin、二进制平铺），
+      # 与上游 release zip 的布局一致，服务器解压方式无需改。
+      - name: Package release tarball
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -czf mcdk-assistant-linux-x64.tar.gz -C package .
+          ls -lh mcdk-assistant-linux-x64.tar.gz
+
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
           name: mcdk-assistant-linux-x64
-          path: package/
+          path: mcdk-assistant-linux-x64.tar.gz
+          retention-days: 7
+          # tarball 已是 gzip，无需再压一层。
+          compression-level: 0
+
+  release:
+    name: Publish rolling release
+    needs: build
+    # 只有 main 分支的推送、或手动触发，才更新 latest release；
+    # 特性分支的推送只产出 artifact，不动 release。
+    if: >
+      (github.event_name == 'push' && github.ref == 'refs/heads/main')
+      || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download build artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: mcdk-assistant-linux-x64
+
+      # 删除旧的 latest release 及其 tag，再在当前 commit 上重建，
+      # 保证 tag 始终指向最新构建，而下载地址恒定不变。
+      # 服务器可匿名 curl：
+      #   https://github.com/<repo>/releases/latest/download/mcdk-assistant-linux-x64.tar.gz
+      - name: Publish to the rolling "latest" release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          short_sha="${GITHUB_SHA::7}"
+          asset_url="https://github.com/$GITHUB_REPOSITORY/releases/latest/download/mcdk-assistant-linux-x64.tar.gz"
+          {
+            echo "自动构建于 commit $short_sha。glibc 基线 2.31，可直接在 Ubuntu 20.04 部署机运行。"
+            echo ""
+            echo "匿名下载（地址恒定）：$asset_url"
+          } > release-notes.md
+          gh release delete latest --yes --cleanup-tag --repo "$GITHUB_REPOSITORY" || true
+          gh release create latest \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "Latest build ($short_sha)" \
+            --notes-file release-notes.md \
+            --latest \
+            mcdk-assistant-linux-x64.tar.gz
