@@ -65,6 +65,25 @@ public:
     bool is_cache_only_mode() const { return cache_only_mode_; }
     bool has_reliable_identifier_match(const std::string& keyword) const { return has_identifier_match(keyword); }
 
+    // 精确符号名在请求分区里查不到时的跨分区兜底。
+    // 例：OpenPlayerHitBlockDetection 是 ModAPI/事件/玩家.md 里的 '###' 标题，
+    // 归入 event 索引，但用户按接口直觉查的是 `api <名字>`，只搜 api 索引必然落空。
+    // 命中时通过 found_scope 回传实际所在分区，供调用方在结果里标注。
+    std::vector<SearchResult> search_identifier_cross_scope(const std::string& keyword,
+                                                           int top_k,
+                                                           const std::string& exclude_scope,
+                                                           std::string* found_scope) const {
+        if (!is_precise_identifier_query(keyword)) return {};
+        for (const auto& [name, index] : identifier_scopes()) {
+            if (name == exclude_scope) continue;
+            auto hits = search_identifier_index(*index, keyword, top_k);
+            if (hits.empty()) continue;
+            if (found_scope) *found_scope = name;
+            return hits;
+        }
+        return {};
+    }
+
     std::vector<SearchResult> search_api(const std::string& keyword, int top_k = -1) const {
         return search_category_flexible(api_index_, keyword, top_k, SearchMode::Auto);
     }
@@ -730,6 +749,17 @@ private:
         return results;
     }
 
+    // 带标识符索引的分区，按「用户最可能想要」的顺序排列。
+    std::vector<std::pair<std::string, const CategoryIndex*>> identifier_scopes() const {
+        return {
+            {"api",     &api_index_},
+            {"event",   &event_index_},
+            {"enum",    &enum_index_},
+            {"qumod",   &qumod_index_},
+            {"netease", &netease_guide_index_},
+        };
+    }
+
     bool has_identifier_match(const std::string& keyword) const {
         if (!is_precise_identifier_query(keyword)) return true;
         const auto matches = [&](const CategoryIndex& idx) {
@@ -914,6 +944,21 @@ private:
         search_text::normalize_tokens(tokens);
     }
 
+    // GameAssets 索引整份读进内存并按文本分词，二进制资源（贴图/音频/模型）进来
+    // 只会污染 BM25 并撑大缓存。用扩展名白名单挡在扫描阶段，作为后续补充资源
+    // 快照的前置保护。
+    static bool is_indexable_game_asset(const std::string& rel_path) {
+        const auto dot = rel_path.find_last_of('.');
+        if (dot == std::string::npos) return false;
+        std::string ext = rel_path.substr(dot + 1);
+        for (auto& c : ext) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        static const std::unordered_set<std::string> kTextAssetExts = {
+            "json", "material", "fragment", "vertex", "h", "lang",
+            "txt", "mcmeta", "properties", "csv", "tsv", "glsl", "hlsl", "cfg",
+        };
+        return kTextAssetExts.count(ext) != 0;
+    }
+
     static std::string make_asset_path_snippet(const std::string& rel_path) {
         return std::string("[PATH MATCH] ") + rel_path;
     }
@@ -983,7 +1028,8 @@ private:
             if (rel_path.find("GameAssets/") == 0 || rel_path.find("GameAssets\\") == 0) {
                 std::string assets_rel = rel_path.substr(std::string("GameAssets/").size());
                 for (auto& c : assets_rel) if (c == '\\') c = '/';
-                if (assets_rel.find("behavior_packs/") == 0 || assets_rel.find("resource_packs/") == 0)
+                if ((assets_rel.find("behavior_packs/") == 0 || assets_rel.find("resource_packs/") == 0)
+                    && is_indexable_game_asset(assets_rel))
                     ga_files.push_back({entry.path(), assets_rel});
                 continue;
             }

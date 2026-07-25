@@ -34,6 +34,17 @@ inline std::unordered_set<std::string> load_stop_words(const std::filesystem::pa
     return stop_words;
 }
 
+// ASCII 小写化，保留非 ASCII 字节，且【不去重】。
+// 索引侧必须用这个而不是 normalize_tokens：后者会去重，把 BM25 的词频压成 1。
+inline void lower_ascii_tokens(std::vector<std::string>& tokens) {
+    for (auto& token : tokens) {
+        for (auto& c : token) {
+            const auto byte = static_cast<unsigned char>(c);
+            if (byte < 128) c = static_cast<char>(std::tolower(byte));
+        }
+    }
+}
+
 inline void tokenize_zh(cppjieba::Jieba& jieba,
                         const std::unordered_set<std::string>& stop_words,
                         const std::string& text,
@@ -46,6 +57,9 @@ inline void tokenize_zh(cppjieba::Jieba& jieba,
         if (stop_words.count(w)) continue;
         tokens.push_back(std::move(w));
     }
+    // jieba 保留原始大小写，而查询侧的 tokenize_en 一律小写；不在这里统一，
+    // 正文/表格里的 PickFacing、Facing、Up 这类符号将永远匹配不到英文查询。
+    lower_ascii_tokens(tokens);
 }
 
 inline void tokenize_en(const std::string& text, std::vector<std::string>& tokens) {

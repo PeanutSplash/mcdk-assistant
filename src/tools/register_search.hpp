@@ -74,7 +74,8 @@ inline mcp::json docs_error(const std::string& message) {
 }
 
 inline mcp::json render_search_response(const std::string& query, const std::string& corpus,
-                                        const std::vector<SearchResult>& results, int max_chars = 6000) {
+                                        const std::vector<SearchResult>& results, int max_chars = 6000,
+                                        bool low_confidence = false) {
     max_chars = std::clamp(max_chars, 512, 20000);
     mcp::json hits = mcp::json::array();
     std::string text;
@@ -106,8 +107,12 @@ inline mcp::json render_search_response(const std::string& query, const std::str
         return {{"content", mcp::json::array({{{"type", "text"}, {"text", text}}})},
                 {"structuredContent", {{"query", query}, {"status", "not_found"}, {"truncated", false}, {"hits", hits}}}};
     }
+    if (low_confidence) {
+        text = "未找到与 '" + query + "' 精确匹配的符号，以下为近似候选（可能不是你要的接口）：\n\n" + text;
+    }
     return {{"content", mcp::json::array({{{"type", "text"}, {"text", text}}})},
-            {"structuredContent", {{"query", query}, {"status", "ok"}, {"truncated", truncated}, {"hits", hits}}}};
+            {"structuredContent", {{"query", query}, {"status", low_confidence ? "low_confidence" : "ok"},
+                                   {"truncated", truncated}, {"hits", hits}}}};
 }
 
 // ── 文档检索 handler（按 SearchFn 选择分区/聚合搜索）──
@@ -118,9 +123,12 @@ inline mcp::json handle_search(SearchService& svc, SearchFn fn, const mcp::json&
         ? params["top_k"].get<int>() : 6;
 
     const int max_chars = params.value("max_chars", 6000);
-    if (!svc.has_reliable_identifier_match(keyword) && params.value("corpus", "auto") != "wiki" && params.value("corpus", "auto") != "dev")
-        return render_search_response(keyword, params.value("corpus", "auto"), {}, max_chars);
-    return render_search_response(keyword, params.value("corpus", "auto"), (svc.*fn)(keyword, top_k), max_chars);
+    const std::string corpus = params.value("corpus", "auto");
+    // 精确符号名在标识符索引里没命中时，此前直接丢弃全部 BM25 结果返回空 not_found，
+    // 连"最接近的候选 + 所在文件"都拿不到。改为降级返回候选并标 low_confidence。
+    const bool low_confidence = !svc.has_reliable_identifier_match(keyword) &&
+                                corpus != "wiki" && corpus != "dev";
+    return render_search_response(keyword, corpus, (svc.*fn)(keyword, top_k), max_chars, low_confidence);
 }
 
 // ── 原版游戏资产模糊搜索 handler ──

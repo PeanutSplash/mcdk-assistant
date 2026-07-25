@@ -20,15 +20,17 @@ inline std::string fs_native_narrow(const std::filesystem::path& path) {
     return path.string();
 }
 
-// 索引缓存文件格式 (v6):
+// 索引缓存文件格式 (v7):
 // [magic: 8B] [version: 4B] [fingerprint] [data...]
 // v5: 倒排表存储 (doc_id, tf) 对而非仅 doc_id，搜索时 O(1) 取 TF
+// v7: tokenize_zh 统一 ASCII 小写。fingerprint 只覆盖 knowledge/dicts 内容，
+//     分词器变更不会让它变化，必须靠 VERSION 强制旧缓存重建。
 // GameAssets: entries 只存 rel_path，content 直接从 fragments 引用
 
 class IndexCache {
 public:
     static constexpr char     MAGIC[8] = {'M','C','D','K','I','D','X','\0'};
-    static constexpr uint32_t VERSION  = 6;
+    static constexpr uint32_t VERSION  = 7;
     static constexpr uint64_t MAX_CACHE_BYTES = 4ULL * 1024 * 1024 * 1024;
     static constexpr uint32_t MAX_STRING_BYTES = 16U * 1024 * 1024;
     static constexpr uint32_t MAX_FRAGMENTS = 500000;

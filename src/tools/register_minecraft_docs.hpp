@@ -76,12 +76,23 @@ inline bool is_identifier_query(const std::string& text) {
     return true;
 }
 
+// 返回 Markdown 标题级别（'#' 的个数，要求其后紧跟空白）；非标题行返回 0。
+inline size_t markdown_heading_level(const std::string& line) {
+    size_t level = 0;
+    while (level < line.size() && line[level] == '#') ++level;
+    if (level == 0 || level >= line.size()) return 0;
+    return std::isspace(static_cast<unsigned char>(line[level])) ? level : 0;
+}
+
+// 接口/事件条目在知识库里既有 '##' 也有 '###'（例如 ModAPI/事件/玩家.md 的
+// OpenPlayerHitBlockDetection 是三级标题）。只认 '##' 会让这类条目永远匹配不上。
 inline std::string markdown_heading(const std::string& content) {
     std::istringstream lines(content);
     std::string line;
     while (std::getline(lines, line)) {
         line = trim_ascii(line);
-        if (line.rfind("## ", 0) == 0) return trim_ascii(line.substr(3));
+        const size_t level = markdown_heading_level(line);
+        if (level >= 2 && level <= 4) return trim_ascii(line.substr(level + 1));
     }
     return {};
 }
@@ -97,15 +108,18 @@ inline std::optional<SearchResult> find_exact_heading(const std::vector<SearchRe
     return std::nullopt;
 }
 
+// 截到「同级或更高级」的下一个标题为止。对三级条目按 '##' 截断会把后面整段
+// 兄弟条目一起带出来，对二级条目按 '###' 截断又会把自己的子小节切掉。
 inline std::string markdown_h2_section(std::string text) {
     std::istringstream lines(text);
     std::string line;
     std::string section;
-    bool saw_first_heading = false;
+    size_t first_level = 0;
     while (std::getline(lines, line)) {
-        if (line.rfind("## ", 0) == 0) {
-            if (saw_first_heading) break;
-            saw_first_heading = true;
+        const size_t level = markdown_heading_level(line);
+        if (level >= 2 && level <= 4) {
+            if (first_level == 0) first_level = level;
+            else if (level <= first_level) break;
         }
         section += line;
         section += '\n';
@@ -498,7 +512,21 @@ inline mcp::json dispatch_scoped_search(const std::filesystem::path& knowledge_r
     if (exact_section) {
         const int exact_top = std::max(top_k, 20);
         auto exact_match = find_exact_heading((svc.*fn)(keyword, exact_top), keyword);
-        if (exact_match) result = read_heading_section(knowledge_root, svc, *exact_match);
+        if (exact_match) {
+            result = read_heading_section(knowledge_root, svc, *exact_match);
+        } else {
+            // 请求分区没有，但别的分区可能以标题形式收录了同一个符号。
+            std::string found_scope;
+            const auto cross = svc.search_identifier_cross_scope(keyword, exact_top, scope, &found_scope);
+            if (const auto cross_match = find_exact_heading(cross, keyword)) {
+                result = read_heading_section(knowledge_root, svc, *cross_match);
+                const std::string note = "注意：'" + keyword + "' 收录在 " + found_scope +
+                    " 分区（" + cross_match->fragment->file + "），不在 " + scope +
+                    " 分区；以下为跨分区自动返回的结果。\n\n";
+                std::string annotated = note + result_text(result);
+                result = replace_result_text(std::move(result), annotated);
+            }
+        }
     }
 
     if (result.is_null()) {
@@ -716,7 +744,7 @@ inline mcp::json typed_guide(const mcp::json& params) {
 
 inline mcp::json search_output_schema() {
     return {{"type", "object"}, {"required", mcp::json::array({"query", "status", "hits"})},
-            {"properties", {{"query", {{"type", "string"}}}, {"status", {{"enum", mcp::json::array({"ok", "not_found", "ambiguous"})}}},
+            {"properties", {{"query", {{"type", "string"}}}, {"status", {{"enum", mcp::json::array({"ok", "not_found", "ambiguous", "low_confidence"})}}},
                 {"truncated", {{"type", "boolean"}}}, {"hits", {{"type", "array"}}}}}};
 }
 

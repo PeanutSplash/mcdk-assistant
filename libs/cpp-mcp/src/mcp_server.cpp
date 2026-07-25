@@ -43,6 +43,17 @@ namespace mcp {
 #endif
         // Use elastic_task_queue: one detached thread per connection, no fixed upper bound.
         http_server_->new_task_queue = [] { return new elastic_task_queue(); };
+
+        // httplib defaults to a 5s keep-alive window and closes idle connections
+        // on its own.  MCP clients hold one persistent connection across calls,
+        // so a client POST racing that server-side close surfaces as a random
+        // "socket connection was closed unexpectedly" that succeeds on retry.
+        // Widen the window well past any realistic gap between tool calls, and
+        // raise the per-connection request cap so long sessions never hit it.
+        http_server_->set_keep_alive_timeout(120);
+        http_server_->set_keep_alive_max_count(10000);
+        http_server_->set_read_timeout(30, 0);
+        http_server_->set_write_timeout(30, 0);
     }
 
     server::~server() { stop(); }
