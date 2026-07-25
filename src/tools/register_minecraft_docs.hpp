@@ -137,12 +137,40 @@ inline mcp::json read_heading_section(const std::filesystem::path& knowledge_roo
         {"line_end", start + 239},
     };
     auto response = handle_read_knowledge(knowledge_root, svc, params);
-    if (!response.contains("content") || !response["content"].is_array() || response["content"].empty())
+    if (!response.contains("structuredContent") || !response["structuredContent"].is_object())
         return response;
-    auto& item = response["content"][0];
-    if (item.is_object() && item.value("type", "") == "text") {
-        item["text"] = markdown_h2_section(item.value("text", ""));
-        item["section"] = true;
+    auto& structured = response["structuredContent"];
+    if (!structured.contains("content") || !structured["content"].is_string())
+        return response;
+
+    // 截断必须同时落到 structuredContent：只改 content[0].text 的话，优先读
+    // structuredContent 的客户端仍会拿到整整 240 行，把相邻接口一起灌进上下文。
+    // 顺带按截断后的实际范围重算 line_end / has_more / ref，否则 ref 指向的行号
+    // 与返回的正文对不上。
+    std::string section = markdown_h2_section(structured["content"].get<std::string>());
+    const int line_start = structured.value("line_start", start);
+    const int section_lines = static_cast<int>(std::count(section.begin(), section.end(), '\n'));
+    const int line_end = section_lines > 0 ? line_start + section_lines - 1
+                                          : structured.value("line_end", line_start);
+    const int total_lines = structured.value("total_lines", 0);
+    const bool has_more = total_lines > line_end;
+    const std::string file = structured.value("file", "");
+    const std::string ref = docs_ref(file, line_start, line_end);
+
+    structured["content"] = section;
+    structured["line_end"] = line_end;
+    structured["has_more"] = has_more;
+    structured["next_start"] = has_more ? line_end + 1 : 0;
+    structured["ref"] = ref;
+    structured["section"] = true;
+
+    if (response.contains("content") && response["content"].is_array() && !response["content"].empty()) {
+        auto& item = response["content"][0];
+        if (item.is_object() && item.value("type", "") == "text") {
+            item["text"] = "source: " + file + ":" + std::to_string(line_start) + "-" +
+                std::to_string(line_end) + "\nref: " + ref + "\n\n" + section;
+            item["section"] = true;
+        }
     }
     return response;
 }
@@ -525,6 +553,12 @@ inline mcp::json dispatch_scoped_search(const std::filesystem::path& knowledge_r
                     " 分区；以下为跨分区自动返回的结果。\n\n";
                 std::string annotated = note + result_text(result);
                 result = replace_result_text(std::move(result), annotated);
+                // 同样要进 structuredContent，否则只读结构化字段的客户端看不到
+                // 「这条其实在别的分区」这个关键信息。
+                if (result.contains("structuredContent") && result["structuredContent"].is_object()) {
+                    result["structuredContent"]["cross_scope_from"] = found_scope;
+                    result["structuredContent"]["requested_scope"] = scope;
+                }
             }
         }
     }
