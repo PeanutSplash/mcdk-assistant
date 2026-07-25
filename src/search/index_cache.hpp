@@ -186,7 +186,11 @@ public:
         std::fseek(fp, 0, SEEK_END);
         long fsize = std::ftell(fp);
         std::fseek(fp, 0, SEEK_SET);
-        if (fsize < 16 || static_cast<uint64_t>(fsize) > MAX_CACHE_BYTES) { std::fclose(fp); return false; }
+        if (fsize < 16 || static_cast<uint64_t>(fsize) > MAX_CACHE_BYTES) {
+            std::cerr << "[MCDK] cache: file size " << fsize << " out of range (limit "
+                      << MAX_CACHE_BYTES << ")" << std::endl;
+            std::fclose(fp); return false;
+        }
 
         char magic[8];
         if (std::fread(magic, 1, 8, fp) != 8 || std::memcmp(magic, MAGIC, 8) != 0) {
@@ -200,33 +204,69 @@ public:
             std::fclose(fp); return false;
         }
 
-        if (!fread_string(fp, out.fingerprint)) { std::fclose(fp); return false; }
+        if (!fread_string(fp, out.fingerprint)) {
+            std::cerr << "[MCDK] cache: fingerprint field read failed" << std::endl;
+            std::fclose(fp); return false;
+        }
         if (!skip_fingerprint_check && out.fingerprint != expected_fp) {
             std::cerr << "[MCDK] cache: fingerprint mismatch, rebuilding" << std::endl;
             std::fclose(fp); return false;
         }
 
         uint32_t cat_n = 0;
-        if (!fread_u32(fp, cat_n) || cat_n != 7) { std::fclose(fp); return false; }
+        if (!fread_u32(fp, cat_n) || cat_n != 7) {
+            std::cerr << "[MCDK] cache: bad category count " << cat_n << " (expected 7)" << std::endl;
+            std::fclose(fp); return false;
+        }
         out.categories.resize(cat_n);
         for (uint32_t i = 0; i < cat_n; ++i) {
-            if (!fread_fragments(fp, out.categories[i].fragments)) { std::fclose(fp); return false; }
-            if (!fread_tokenized(fp, out.categories[i].tokenized_docs)) { std::fclose(fp); return false; }
-            if (!fread_bm25(fp, out.categories[i].bm25)) { std::fclose(fp); return false; }
+            if (!fread_fragments(fp, out.categories[i].fragments)) {
+                std::cerr << "[MCDK] cache: category[" << i << "] fragments read failed" << std::endl;
+                std::fclose(fp); return false;
+            }
+            if (!fread_tokenized(fp, out.categories[i].tokenized_docs)) {
+                std::cerr << "[MCDK] cache: category[" << i << "] tokenized read failed "
+                             "(oversized doc? tokens > MAX_TOKENS_PER_DOC=" << MAX_TOKENS_PER_DOC << ")" << std::endl;
+                std::fclose(fp); return false;
+            }
+            if (!fread_bm25(fp, out.categories[i].bm25)) {
+                std::cerr << "[MCDK] cache: category[" << i << "] bm25 read failed" << std::endl;
+                std::fclose(fp); return false;
+            }
         }
 
         uint32_t ga_n = 0;
-        if (!fread_u32(fp, ga_n) || ga_n != 2) { std::fclose(fp); return false; }
+        if (!fread_u32(fp, ga_n) || ga_n != 2) {
+            std::cerr << "[MCDK] cache: bad game-asset group count " << ga_n << " (expected 2)" << std::endl;
+            std::fclose(fp); return false;
+        }
         out.game_assets.resize(ga_n);
         for (uint32_t i = 0; i < ga_n; ++i) {
             uint32_t rp_n = 0;
-            if (!fread_u32(fp, rp_n) || rp_n > MAX_FRAGMENTS) { std::fclose(fp); return false; }
+            if (!fread_u32(fp, rp_n) || rp_n > MAX_FRAGMENTS) {
+                std::cerr << "[MCDK] cache: game_assets[" << i << "] rel_path count " << rp_n
+                          << " > MAX_FRAGMENTS=" << MAX_FRAGMENTS << std::endl;
+                std::fclose(fp); return false;
+            }
             out.game_assets[i].rel_paths.resize(rp_n);
             for (uint32_t j = 0; j < rp_n; ++j)
-                if (!fread_string(fp, out.game_assets[i].rel_paths[j])) { std::fclose(fp); return false; }
-            if (!fread_fragments(fp, out.game_assets[i].fragments)) { std::fclose(fp); return false; }
-            if (!fread_tokenized(fp, out.game_assets[i].tokenized_docs)) { std::fclose(fp); return false; }
-            if (!fread_bm25(fp, out.game_assets[i].bm25)) { std::fclose(fp); return false; }
+                if (!fread_string(fp, out.game_assets[i].rel_paths[j])) {
+                    std::cerr << "[MCDK] cache: game_assets[" << i << "] rel_path[" << j << "] read failed" << std::endl;
+                    std::fclose(fp); return false;
+                }
+            if (!fread_fragments(fp, out.game_assets[i].fragments)) {
+                std::cerr << "[MCDK] cache: game_assets[" << i << "] fragments read failed" << std::endl;
+                std::fclose(fp); return false;
+            }
+            if (!fread_tokenized(fp, out.game_assets[i].tokenized_docs)) {
+                std::cerr << "[MCDK] cache: game_assets[" << i << "] tokenized read failed "
+                             "(oversized doc? tokens > MAX_TOKENS_PER_DOC=" << MAX_TOKENS_PER_DOC << ")" << std::endl;
+                std::fclose(fp); return false;
+            }
+            if (!fread_bm25(fp, out.game_assets[i].bm25)) {
+                std::cerr << "[MCDK] cache: game_assets[" << i << "] bm25 read failed" << std::endl;
+                std::fclose(fp); return false;
+            }
         }
 
         bool ok = std::ferror(fp) == 0;

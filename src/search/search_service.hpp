@@ -1110,11 +1110,88 @@ private:
     }
 
     // ── 构建 BM25 索引 ──
+    // ── 超限文档切分 ──
+    // 根因修复：写入端（构建索引）此前对单文档 token 数无上限，而读取端
+    // IndexCache::load() 会拒绝任何 token 数 > MAX_TOKENS_PER_DOC 的文档，且
+    // 一处失败即整份缓存加载失败（all-or-nothing）。原版资源包中的若干超大
+    // JSON（如 player.2.animation.json，45.6 万 token）因此让整个知识库索引在
+    // 分发（cache-only）模式下静默变空。这里在建 BM25 之前，把超限文档按行/
+    // 字节边界切成多个「同 file」的子片段：游戏资源结果按 file 聚合，切分对外
+    // 不可见；内容一字不丢（拆分而非截断）；每个文档落在 AI 友好的检索粒度内；
+    // 且写入端 token 数恒低于读取端上限，从根上消除写读不一致。
+    template <typename TokFn>
+    static void split_oversized_docs(std::vector<DocFragment>& frags,
+                                     std::vector<std::vector<std::string>>& toks,
+                                     TokFn&& tokfn) {
+        constexpr size_t kSplitTargetTokens = 4000;    // 目标切块大小（AI 友好检索粒度）
+        constexpr size_t kSplitMaxTokens    = 16000;   // 触发切分阈值 / 存储硬上限
+        static_assert(kSplitMaxTokens < IndexCache::MAX_TOKENS_PER_DOC,
+                      "build-time per-doc token cap must stay below the loader's MAX_TOKENS_PER_DOC");
+
+        bool any = false;
+        for (const auto& t : toks) if (t.size() > kSplitMaxTokens) { any = true; break; }
+        if (!any) return;
+
+        std::vector<DocFragment> out_frags;
+        std::vector<std::vector<std::string>> out_toks;
+        out_frags.reserve(frags.size());
+        out_toks.reserve(frags.size());
+
+        for (size_t i = 0; i < frags.size(); ++i) {
+            if (toks[i].size() <= kSplitMaxTokens) {
+                out_frags.push_back(std::move(frags[i]));
+                out_toks.push_back(std::move(toks[i]));
+                continue;
+            }
+            const std::string content    = std::move(frags[i].content);
+            const std::string file        = frags[i].file;
+            const int         line_start  = frags[i].line_start;
+            const int         line_end    = frags[i].line_end;
+            const size_t total_tokens  = std::max<size_t>(1, toks[i].size());
+            const size_t bytes_per_tok = std::max<size_t>(1, content.size() / total_tokens);
+            const size_t win           = std::max<size_t>(64, kSplitTargetTokens * bytes_per_tok);
+
+            std::cerr << "[MCDK] split oversized doc: " << file << " ("
+                      << total_tokens << " tokens) into ~" << kSplitTargetTokens
+                      << "-token chunks" << std::endl;
+
+            size_t pos = 0;
+            while (pos < content.size()) {
+                size_t end = std::min(content.size(), pos + win);
+                if (end < content.size()) {
+                    // 优先在换行处切；无换行则退到 UTF-8 字符边界，避免切裂多字节字符。
+                    size_t nl = content.rfind('\n', end);
+                    if (nl != std::string::npos && nl + 1 > pos) {
+                        end = nl + 1;
+                    } else {
+                        while (end > pos && (static_cast<unsigned char>(content[end]) & 0xC0) == 0x80) --end;
+                        if (end == pos) end = std::min(content.size(), pos + win);
+                    }
+                }
+                DocFragment sub;
+                sub.content    = content.substr(pos, end - pos);
+                sub.file       = file;
+                sub.line_start = line_start;
+                sub.line_end   = line_end;
+                std::vector<std::string> sub_tok;
+                tokfn(sub.content, sub_tok);
+                if (sub_tok.size() > kSplitMaxTokens) sub_tok.resize(kSplitMaxTokens);  // 病态单块兜底
+                out_frags.push_back(std::move(sub));
+                out_toks.push_back(std::move(sub_tok));
+                pos = end;
+            }
+        }
+        frags = std::move(out_frags);
+        toks  = std::move(out_toks);
+    }
+
     void build_indices() {
         auto build_cn = [this](CategoryIndex& idx, const char* name) {
             idx.tokenized_docs.resize(idx.fragments.size());
             for (size_t i = 0; i < idx.fragments.size(); ++i)
                 tokenize(idx.fragments[i].content, idx.tokenized_docs[i]);
+            split_oversized_docs(idx.fragments, idx.tokenized_docs,
+                                 [this](const std::string& s, std::vector<std::string>& o) { tokenize(s, o); });
             idx.engine.build_index(idx.fragments, idx.tokenized_docs);
             std::cerr << "[MCDK] " << name << " index: " << idx.fragments.size() << " docs" << std::endl;
         };
@@ -1133,6 +1210,8 @@ private:
                 }));
             }
             for (auto& f : futs) f.get();
+            split_oversized_docs(idx.fragments, idx.tokenized_docs,
+                                 [](const std::string& s, std::vector<std::string>& o) { tokenize_en(s, o); });
             idx.engine.build_index(idx.fragments, idx.tokenized_docs);
             std::cerr << "[MCDK] " << name << " index: " << idx.fragments.size() << " docs" << std::endl;
         };
@@ -1161,6 +1240,8 @@ private:
                 }));
             }
             for (auto& f : futs) f.get();
+            split_oversized_docs(idx.fragments, idx.tokenized_docs,
+                                 [](const std::string& s, std::vector<std::string>& o) { tokenize_en(s, o); });
             idx.engine.build_index(idx.fragments, idx.tokenized_docs);
             std::cerr << "[MCDK] " << name << " index: " << idx.fragments.size() << " docs" << std::endl;
         };
